@@ -48,21 +48,6 @@ type ProjectNote = {
   createdAtMillis: number;
 };
 
-type HistoryActivity = {
-  id: string;
-  type: "Project Dibuat" | "Project Selesai" | "Note Progress";
-  title: string;
-  projectId: string;
-  projectTitle: string;
-  client: string;
-  status: ProjectStatus;
-  priority: ProjectPriority;
-  activityDate: string;
-  description: string;
-  createdAtText: string;
-  createdAtMillis: number;
-};
-
 const statusOptions: ProjectStatus[] = [
   "Belum Mulai",
   "Proses",
@@ -198,47 +183,69 @@ export default function Home() {
   });
   const overdueProjects = activeProjects.filter((item) => getDaysLeft(item.deadlineDate) < 0);
 
-  const historyActivities = useMemo<HistoryActivity[]>(() => {
-    const projectMap = new Map(projects.map((project) => [project.id, project]));
-
+  const activityRows = useMemo(() => {
     const projectActivities = projects.map((project) => ({
       id: `project-${project.id}`,
-      type: (project.status === "Selesai" ? "Project Selesai" : "Project Dibuat") as const,
+      type: project.status === "Selesai" ? "Project Selesai" : "Project Dibuat",
       title: project.status === "Selesai" ? "Project ditandai selesai" : "Project dibuat",
       projectId: project.id,
       projectTitle: project.title,
       client: project.client,
       status: project.status,
       priority: project.priority,
-      activityDate: project.createdAtText,
-      description: project.notes || `Deadline ${project.deadlineDate}`,
-      createdAtText: project.createdAtText,
-      createdAtMillis: project.createdAtMillis,
+      date: project.createdAtText,
+      dateValue: project.createdAtMillis || new Date(project.masukDate).getTime(),
+      note: project.notes,
+      icon: project.status === "Selesai" ? "✅" : "🗂️",
     }));
 
     const noteActivities = notes.map((note) => {
-      const project = projectMap.get(note.projectId);
+      const project = projects.find((item) => item.id === note.projectId);
 
       return {
         id: `note-${note.id}`,
-        type: "Note Progress" as const,
+        type: "Note Progress",
         title: "Note progress ditambahkan",
         projectId: note.projectId,
         projectTitle: project?.title ?? "Project tidak ditemukan",
         client: project?.client ?? "",
         status: project?.status ?? "Belum Mulai",
         priority: project?.priority ?? "Normal",
-        activityDate: note.noteDate,
-        description: note.note,
-        createdAtText: note.createdAtText,
-        createdAtMillis: note.createdAtMillis,
+        date: note.createdAtText,
+        dateValue: note.createdAtMillis || new Date(note.noteDate).getTime(),
+        note: note.note,
+        icon: "📝",
       };
     });
 
-    return [...noteActivities, ...projectActivities].sort(
-      (a, b) => b.createdAtMillis - a.createdAtMillis
-    );
+    return [...projectActivities, ...noteActivities].sort((a, b) => b.dateValue - a.dateValue);
   }, [projects, notes]);
+
+  const filteredActivityRows = useMemo(() => {
+    const normalizedSearch = search.trim().toLowerCase();
+
+    return activityRows.filter((activity) => {
+      const matchesSearch = normalizedSearch
+        ? [
+            activity.type,
+            activity.title,
+            activity.projectTitle,
+            activity.client,
+            activity.status,
+            activity.priority,
+            activity.note,
+          ]
+            .join(" ")
+            .toLowerCase()
+            .includes(normalizedSearch)
+        : true;
+
+      const matchesStatus = filterStatus ? activity.status === filterStatus : true;
+      const matchesPriority = filterPriority ? activity.priority === filterPriority : true;
+
+      return matchesSearch && matchesStatus && matchesPriority;
+    });
+  }, [activityRows, search, filterStatus, filterPriority]);
 
   const resetForm = () => {
     setEditingProjectId("");
@@ -838,79 +845,72 @@ export default function Home() {
           </section>
         ) : null}
 
+
         {activeMenu === "riwayat" ? (
           <section className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
-            <div className="mb-4 flex items-center justify-between gap-3">
+            <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
               <div>
                 <h2 className="text-xl font-black">Riwayat Aktivitas</h2>
-                <p className={`text-sm ${mutedText}`}>
-                  Timeline semua update project dan note progress.
-                </p>
+                <p className={`text-sm ${mutedText}`}>Timeline project dibuat, project selesai, dan note progress.</p>
               </div>
-              <button onClick={fetchProjects} className={`rounded-2xl border ${borderColor} px-3 py-2 text-sm font-bold`}>
-                Refresh
-              </button>
+              <button onClick={fetchProjects} className={`rounded-2xl border ${borderColor} px-3 py-2 text-sm font-bold`}>Refresh</button>
             </div>
 
-            <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">
-              {[
-                ["Total Aktivitas", historyActivities.length],
-                ["Note Progress", notes.length],
-                ["Project Aktif", activeProjects.length],
-                ["Project Selesai", doneProjects.length],
-              ].map(([label, value]) => (
-                <div key={label} className={`rounded-[1.5rem] border ${borderColor} ${softCardBg} p-4`}>
-                  <p className={`text-xs font-bold ${mutedText}`}>{label}</p>
-                  <p className="mt-2 text-2xl font-black">{value}</p>
-                </div>
-              ))}
+            <div className="mb-4 space-y-2">
+              <input value={search} onChange={(event) => setSearch(event.target.value)} className={inputClass} placeholder="Cari riwayat/project/note" />
+              <div className="grid grid-cols-2 gap-2">
+                <select value={filterStatus} onChange={(event) => setFilterStatus(event.target.value as ProjectStatus | "")} className={inputClass}>
+                  <option value="">Semua Status</option>
+                  {statusOptions.map((item) => <option key={item}>{item}</option>)}
+                </select>
+                <select value={filterPriority} onChange={(event) => setFilterPriority(event.target.value as ProjectPriority | "")} className={inputClass}>
+                  <option value="">Semua Prioritas</option>
+                  {priorityOptions.map((item) => <option key={item}>{item}</option>)}
+                </select>
+              </div>
             </div>
 
-            {historyActivities.length === 0 ? (
-              <p className={mutedText}>Belum ada riwayat aktivitas.</p>
+            {filteredActivityRows.length === 0 ? (
+              <div className={`rounded-3xl border ${borderColor} ${softCardBg} p-5 text-center`}>
+                <p className="font-black">Belum ada riwayat.</p>
+                <p className={`mt-1 text-sm ${mutedText}`}>Aktivitas project dan note progress akan muncul di sini.</p>
+              </div>
             ) : (
               <div className="space-y-3">
-                {historyActivities.map((activity) => (
+                {filteredActivityRows.map((activity) => (
                   <button
                     key={activity.id}
                     type="button"
                     onClick={() => {
-                      if (activity.projectId) {
-                        setSelectedProjectId(activity.projectId);
-                        setActiveMenu("project");
-                      }
+                      setSelectedProjectId(activity.projectId);
+                      setActiveMenu("project");
                     }}
                     className={`w-full rounded-3xl border ${borderColor} ${softCardBg} p-4 text-left transition hover:border-[#A7F3D0]`}
                   >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="mb-2 flex flex-wrap items-center gap-2">
-                          <span className="rounded-full bg-[#A7F3D0] px-3 py-1 text-[10px] font-black text-[#111214]">
+                    <div className="flex items-start gap-3">
+                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-[#A7F3D0] text-lg text-[#111214]">
+                        {activity.icon}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="rounded-full bg-[#A7F3D0]/20 px-3 py-1 text-[11px] font-black text-[#A7F3D0]">
                             {activity.type}
                           </span>
-                          <span
-                            className={`rounded-full px-3 py-1 text-[10px] font-black ${
-                              activity.status === "Selesai"
-                                ? "bg-emerald-100 text-emerald-700"
-                                : activity.status === "Hold"
-                                ? "bg-neutral-200 text-neutral-700"
-                                : activity.status === "Menunggu"
-                                ? "bg-amber-100 text-amber-700"
-                                : "bg-blue-100 text-blue-700"
-                            }`}
-                          >
-                            {activity.status}
-                          </span>
-                          <span className={`text-xs ${mutedText}`}>{activity.priority}</span>
+                          <span className={`text-xs ${mutedText}`}>{activity.date}</span>
                         </div>
-                        <h3 className="font-black">{activity.projectTitle}</h3>
-                        <p className={`mt-1 text-sm ${mutedText}`}>
-                          {activity.client || "Tanpa client/divisi"} · {activity.activityDate || activity.createdAtText}
-                        </p>
-                        <p className="mt-3 whitespace-pre-wrap text-sm leading-6">{activity.description}</p>
-                        <p className={`mt-2 text-xs ${mutedText}`}>Dicatat: {activity.createdAtText}</p>
+                        <h3 className="mt-2 font-black">{activity.title}</h3>
+                        <p className={`mt-1 text-sm ${mutedText}`}>{activity.projectTitle}</p>
+                        {activity.client ? (
+                          <p className={`mt-0.5 text-xs ${mutedText}`}>{activity.client}</p>
+                        ) : null}
+                        {activity.note ? (
+                          <p className="mt-3 line-clamp-3 whitespace-pre-wrap text-sm leading-6">{activity.note}</p>
+                        ) : null}
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <span className={`rounded-full ${softCardBg} px-3 py-1 text-xs font-bold`}>Status: {activity.status}</span>
+                          <span className={`rounded-full ${softCardBg} px-3 py-1 text-xs font-bold`}>Prioritas: {activity.priority}</span>
+                        </div>
                       </div>
-                      <span className="shrink-0 text-xl">{activity.type === "Note Progress" ? "📝" : activity.type === "Project Selesai" ? "✅" : "🗂️"}</span>
                     </div>
                   </button>
                 ))}
