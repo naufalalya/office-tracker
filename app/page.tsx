@@ -23,7 +23,7 @@ import { auth, db } from "../lib/firebase";
 
 type ProjectStatus = "Belum Mulai" | "Proses" | "Menunggu" | "Hold" | "Selesai";
 type ProjectPriority = "Rendah" | "Normal" | "Penting" | "Urgent";
-type ActiveMenu = "dashboard" | "tambah" | "project" | "riwayat" | "settings";
+type ActiveMenu = "dashboard" | "tambah" | "project" | "riwayat" | "tugas" | "settings";
 
 type WorkProject = {
   id: string;
@@ -44,6 +44,17 @@ type ProjectNote = {
   projectId: string;
   noteDate: string;
   note: string;
+  createdAtText: string;
+  createdAtMillis: number;
+};
+
+type WorkTask = {
+  id: string;
+  userId: string;
+  projectId: string;
+  title: string;
+  taskDate: string;
+  isDone: boolean;
   createdAtText: string;
   createdAtMillis: number;
 };
@@ -120,6 +131,7 @@ export default function Home() {
 
   const [projects, setProjects] = useState<WorkProject[]>([]);
   const [notes, setNotes] = useState<ProjectNote[]>([]);
+  const [tasks, setTasks] = useState<WorkTask[]>([]);
   const [isLoadingProjects, setIsLoadingProjects] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [editingProjectId, setEditingProjectId] = useState("");
@@ -136,6 +148,12 @@ export default function Home() {
   const [noteText, setNoteText] = useState("");
   const [noteDate, setNoteDate] = useState(getTodayInputDate());
   const [isSavingNote, setIsSavingNote] = useState(false);
+
+  const [taskProjectId, setTaskProjectId] = useState("");
+  const [taskTitle, setTaskTitle] = useState("");
+  const [taskDate, setTaskDate] = useState(getTodayInputDate());
+  const [isSavingTask, setIsSavingTask] = useState(false);
+  const [selectedHistoryProjectId, setSelectedHistoryProjectId] = useState("");
 
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState<ProjectStatus | "">("");
@@ -156,6 +174,16 @@ export default function Home() {
   const selectedProjectNotes = notes
     .filter((item) => item.projectId === selectedProjectId)
     .sort((a, b) => b.createdAtMillis - a.createdAtMillis);
+
+  const pendingTasks = tasks
+    .filter((item) => !item.isDone)
+    .sort((a, b) => a.taskDate.localeCompare(b.taskDate));
+
+  const doneTasks = tasks
+    .filter((item) => item.isDone)
+    .sort((a, b) => b.createdAtMillis - a.createdAtMillis);
+
+  const taskProjectOptions = projects.filter((item) => item.status !== "Selesai");
 
   const filteredProjects = useMemo(() => {
     const normalizedSearch = search.trim().toLowerCase();
@@ -218,8 +246,27 @@ export default function Home() {
       };
     });
 
-    return [...projectActivities, ...noteActivities].sort((a, b) => b.dateValue - a.dateValue);
-  }, [projects, notes]);
+    const taskActivities = tasks.map((task) => {
+      const project = projects.find((item) => item.id === task.projectId);
+
+      return {
+        id: `task-${task.id}`,
+        type: task.isDone ? "Tugas Selesai" : "Tugas Dibuat",
+        title: task.isDone ? "Tugas ditandai selesai" : "Tugas ditambahkan",
+        projectId: task.projectId,
+        projectTitle: project?.title ?? "Project tidak ditemukan",
+        client: project?.client ?? "",
+        status: project?.status ?? "Belum Mulai",
+        priority: project?.priority ?? "Normal",
+        date: task.createdAtText,
+        dateValue: task.createdAtMillis || new Date(task.taskDate).getTime(),
+        note: task.title,
+        icon: task.isDone ? "✅" : "☑️",
+      };
+    });
+
+    return [...projectActivities, ...noteActivities, ...taskActivities].sort((a, b) => b.dateValue - a.dateValue);
+  }, [projects, notes, tasks]);
 
   const filteredActivityRows = useMemo(() => {
     const normalizedSearch = search.trim().toLowerCase();
@@ -246,6 +293,35 @@ export default function Home() {
       return matchesSearch && matchesStatus && matchesPriority;
     });
   }, [activityRows, search, filterStatus, filterPriority]);
+
+  const historyProjectRows = useMemo(() => {
+    return filteredProjects
+      .map((project) => {
+        const projectActivities = activityRows.filter((activity) => activity.projectId === project.id);
+        const lastActivity = [...projectActivities].sort((a, b) => b.dateValue - a.dateValue)[0];
+        const noteCount = notes.filter((item) => item.projectId === project.id).length;
+        const taskCount = tasks.filter((item) => item.projectId === project.id).length;
+        const pendingCount = tasks.filter((item) => item.projectId === project.id && !item.isDone).length;
+
+        return {
+          ...project,
+          activityCount: projectActivities.length,
+          noteCount,
+          taskCount,
+          pendingCount,
+          lastActivityText: lastActivity?.date ?? project.createdAtText,
+          lastActivityValue: lastActivity?.dateValue ?? project.createdAtMillis,
+        };
+      })
+      .sort((a, b) => b.lastActivityValue - a.lastActivityValue);
+  }, [filteredProjects, activityRows, notes, tasks]);
+
+  const selectedHistoryProject =
+    projects.find((item) => item.id === selectedHistoryProjectId) ?? historyProjectRows[0] ?? null;
+
+  const selectedHistoryActivities = selectedHistoryProject
+    ? filteredActivityRows.filter((activity) => activity.projectId === selectedHistoryProject.id)
+    : [];
 
   const resetForm = () => {
     setEditingProjectId("");
@@ -274,9 +350,15 @@ export default function Home() {
         where("userId", "==", currentUser.uid)
       );
 
-      const [projectSnapshot, noteSnapshot] = await Promise.all([
+      const taskQuery = query(
+        collection(db, "workProjectTasks"),
+        where("userId", "==", currentUser.uid)
+      );
+
+      const [projectSnapshot, noteSnapshot, taskSnapshot] = await Promise.all([
         getDocs(projectQuery),
         getDocs(noteQuery),
+        getDocs(taskQuery),
       ]);
 
       const mappedProjects = projectSnapshot.docs
@@ -314,11 +396,37 @@ export default function Home() {
         })
         .sort((a, b) => b.createdAtMillis - a.createdAtMillis);
 
+      const mappedTasks = taskSnapshot.docs
+        .map((item) => {
+          const data = item.data();
+
+          return {
+            id: item.id,
+            userId: data.userId ?? "",
+            projectId: data.projectId ?? "",
+            title: data.title ?? "",
+            taskDate: data.taskDate ?? "",
+            isDone: Boolean(data.isDone),
+            createdAtText: formatDateTime(data.createdAt),
+            createdAtMillis: data.createdAt instanceof Timestamp ? data.createdAt.toMillis() : 0,
+          };
+        })
+        .sort((a, b) => a.taskDate.localeCompare(b.taskDate));
+
       setProjects(mappedProjects);
       setNotes(mappedNotes);
+      setTasks(mappedTasks);
 
       if (!selectedProjectId && mappedProjects.length > 0) {
         setSelectedProjectId(mappedProjects[0].id);
+      }
+
+      if (!taskProjectId && mappedProjects.length > 0) {
+        setTaskProjectId(mappedProjects[0].id);
+      }
+
+      if (!selectedHistoryProjectId && mappedProjects.length > 0) {
+        setSelectedHistoryProjectId(mappedProjects[0].id);
       }
     } catch (error) {
       console.error(error);
@@ -504,6 +612,74 @@ export default function Home() {
     }
   };
 
+  const saveTask = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    if (!currentUser) {
+      alert("Login dulu ya.");
+      return;
+    }
+
+    if (!taskProjectId) {
+      alert("Pilih project dulu ya.");
+      return;
+    }
+
+    if (!taskTitle.trim()) {
+      alert("Isi pekerjaan dulu ya.");
+      return;
+    }
+
+    try {
+      setIsSavingTask(true);
+
+      await addDoc(collection(db, "workProjectTasks"), {
+        userId: currentUser.uid,
+        projectId: taskProjectId,
+        title: taskTitle.trim(),
+        taskDate,
+        isDone: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      setTaskTitle("");
+      setTaskDate(getTodayInputDate());
+      await fetchProjects();
+    } catch (error) {
+      console.error(error);
+      alert("Gagal menyimpan pekerjaan.");
+    } finally {
+      setIsSavingTask(false);
+    }
+  };
+
+  const toggleTaskDone = async (task: WorkTask) => {
+    try {
+      await updateDoc(doc(db, "workProjectTasks", task.id), {
+        isDone: !task.isDone,
+        updatedAt: serverTimestamp(),
+      });
+      await fetchProjects();
+    } catch (error) {
+      console.error(error);
+      alert("Gagal mengubah status pekerjaan.");
+    }
+  };
+
+  const deleteTask = async (taskId: string) => {
+    const ok = window.confirm("Hapus pekerjaan ini?");
+    if (!ok) return;
+
+    try {
+      await deleteDoc(doc(db, "workProjectTasks", taskId));
+      await fetchProjects();
+    } catch (error) {
+      console.error(error);
+      alert("Gagal menghapus pekerjaan.");
+    }
+  };
+
   if (isCheckingAuth) {
     return <main className={`min-h-screen ${pageBg} p-6`}>Loading...</main>;
   }
@@ -588,7 +764,7 @@ export default function Home() {
                 ["Project Aktif", activeProjects.length],
                 ["Deadline Dekat", nearDeadlineProjects.length],
                 ["Lewat Deadline", overdueProjects.length],
-                ["Selesai", doneProjects.length],
+                ["Tugas Pending", pendingTasks.length],
               ].map(([label, value]) => (
                 <div key={label} className={`rounded-[1.5rem] border ${borderColor} ${cardBg} p-4`}>
                   <p className={`text-xs font-bold ${mutedText}`}>{label}</p>
@@ -847,75 +1023,233 @@ export default function Home() {
 
 
         {activeMenu === "riwayat" ? (
-          <section className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
-            <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-              <div>
-                <h2 className="text-xl font-black">Riwayat Aktivitas</h2>
-                <p className={`text-sm ${mutedText}`}>Timeline project dibuat, project selesai, dan note progress.</p>
+          <section className="grid gap-4 lg:grid-cols-[0.9fr_1.1fr]">
+            <div className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
+              <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <h2 className="text-xl font-black">Riwayat per Project</h2>
+                  <p className={`text-sm ${mutedText}`}>Pilih main project dulu, baru lihat semua riwayatnya.</p>
+                </div>
+                <button onClick={fetchProjects} className={`rounded-2xl border ${borderColor} px-3 py-2 text-sm font-bold`}>Refresh</button>
               </div>
-              <button onClick={fetchProjects} className={`rounded-2xl border ${borderColor} px-3 py-2 text-sm font-bold`}>Refresh</button>
+
+              <div className="mb-4 space-y-2">
+                <input value={search} onChange={(event) => setSearch(event.target.value)} className={inputClass} placeholder="Cari project/client/status" />
+                <div className="grid grid-cols-2 gap-2">
+                  <select value={filterStatus} onChange={(event) => setFilterStatus(event.target.value as ProjectStatus | "")} className={inputClass}>
+                    <option value="">Semua Status</option>
+                    {statusOptions.map((item) => <option key={item}>{item}</option>)}
+                  </select>
+                  <select value={filterPriority} onChange={(event) => setFilterPriority(event.target.value as ProjectPriority | "")} className={inputClass}>
+                    <option value="">Semua Prioritas</option>
+                    {priorityOptions.map((item) => <option key={item}>{item}</option>)}
+                  </select>
+                </div>
+              </div>
+
+              {historyProjectRows.length === 0 ? (
+                <div className={`rounded-3xl border ${borderColor} ${softCardBg} p-5 text-center`}>
+                  <p className="font-black">Belum ada project.</p>
+                  <p className={`mt-1 text-sm ${mutedText}`}>Project yang dibuat akan muncul di sini.</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {historyProjectRows.map((project) => (
+                    <button
+                      key={project.id}
+                      type="button"
+                      onClick={() => setSelectedHistoryProjectId(project.id)}
+                      className={`w-full rounded-3xl border p-4 text-left transition ${
+                        selectedHistoryProject?.id === project.id
+                          ? "border-[#A7F3D0] bg-[#A7F3D0]/10"
+                          : `${borderColor} ${softCardBg}`
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <h3 className="truncate font-black">{project.title}</h3>
+                          <p className={`mt-1 truncate text-sm ${mutedText}`}>{project.client || "Tanpa client/divisi"}</p>
+                          <p className={`mt-1 text-xs ${mutedText}`}>Aktivitas terakhir: {project.lastActivityText}</p>
+                        </div>
+                        <span className={`shrink-0 rounded-full px-3 py-1 text-xs font-black ${getDeadlineClass(project)}`}>
+                          {getDeadlineLabel(project)}
+                        </span>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <span className={`rounded-full ${softCardBg} px-3 py-1 text-xs font-bold`}>{project.activityCount} aktivitas</span>
+                        <span className={`rounded-full ${softCardBg} px-3 py-1 text-xs font-bold`}>{project.noteCount} note</span>
+                        <span className={`rounded-full ${softCardBg} px-3 py-1 text-xs font-bold`}>{project.pendingCount}/{project.taskCount} tugas pending</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
-            <div className="mb-4 space-y-2">
-              <input value={search} onChange={(event) => setSearch(event.target.value)} className={inputClass} placeholder="Cari riwayat/project/note" />
-              <div className="grid grid-cols-2 gap-2">
-                <select value={filterStatus} onChange={(event) => setFilterStatus(event.target.value as ProjectStatus | "")} className={inputClass}>
-                  <option value="">Semua Status</option>
-                  {statusOptions.map((item) => <option key={item}>{item}</option>)}
-                </select>
-                <select value={filterPriority} onChange={(event) => setFilterPriority(event.target.value as ProjectPriority | "")} className={inputClass}>
-                  <option value="">Semua Prioritas</option>
-                  {priorityOptions.map((item) => <option key={item}>{item}</option>)}
-                </select>
-              </div>
-            </div>
-
-            {filteredActivityRows.length === 0 ? (
-              <div className={`rounded-3xl border ${borderColor} ${softCardBg} p-5 text-center`}>
-                <p className="font-black">Belum ada riwayat.</p>
-                <p className={`mt-1 text-sm ${mutedText}`}>Aktivitas project dan note progress akan muncul di sini.</p>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {filteredActivityRows.map((activity) => (
-                  <button
-                    key={activity.id}
-                    type="button"
-                    onClick={() => {
-                      setSelectedProjectId(activity.projectId);
-                      setActiveMenu("project");
-                    }}
-                    className={`w-full rounded-3xl border ${borderColor} ${softCardBg} p-4 text-left transition hover:border-[#A7F3D0]`}
-                  >
-                    <div className="flex items-start gap-3">
-                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-[#A7F3D0] text-lg text-[#111214]">
-                        {activity.icon}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="rounded-full bg-[#A7F3D0]/20 px-3 py-1 text-[11px] font-black text-[#A7F3D0]">
-                            {activity.type}
-                          </span>
-                          <span className={`text-xs ${mutedText}`}>{activity.date}</span>
-                        </div>
-                        <h3 className="mt-2 font-black">{activity.title}</h3>
-                        <p className={`mt-1 text-sm ${mutedText}`}>{activity.projectTitle}</p>
-                        {activity.client ? (
-                          <p className={`mt-0.5 text-xs ${mutedText}`}>{activity.client}</p>
-                        ) : null}
-                        {activity.note ? (
-                          <p className="mt-3 line-clamp-3 whitespace-pre-wrap text-sm leading-6">{activity.note}</p>
-                        ) : null}
-                        <div className="mt-3 flex flex-wrap gap-2">
-                          <span className={`rounded-full ${softCardBg} px-3 py-1 text-xs font-bold`}>Status: {activity.status}</span>
-                          <span className={`rounded-full ${softCardBg} px-3 py-1 text-xs font-bold`}>Prioritas: {activity.priority}</span>
-                        </div>
-                      </div>
+            <div className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
+              {!selectedHistoryProject ? (
+                <p className={mutedText}>Pilih project untuk lihat riwayatnya.</p>
+              ) : (
+                <div className="space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h2 className="text-xl font-black">{selectedHistoryProject.title}</h2>
+                      <p className={`mt-1 text-sm ${mutedText}`}>Riwayat note, tugas, dan perubahan utama project ini.</p>
                     </div>
-                  </button>
-                ))}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedProjectId(selectedHistoryProject.id);
+                        setActiveMenu("project");
+                      }}
+                      className="rounded-2xl bg-[#A7F3D0] px-4 py-2 text-sm font-black text-[#111214]"
+                    >
+                      Buka Detail
+                    </button>
+                  </div>
+
+                  {selectedHistoryActivities.length === 0 ? (
+                    <div className={`rounded-3xl border ${borderColor} ${softCardBg} p-5 text-center`}>
+                      <p className="font-black">Belum ada riwayat untuk project ini.</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {selectedHistoryActivities.map((activity) => (
+                        <div key={activity.id} className={`rounded-3xl border ${borderColor} ${softCardBg} p-4`}>
+                          <div className="flex items-start gap-3">
+                            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-[#A7F3D0] text-lg text-[#111214]">
+                              {activity.icon}
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="rounded-full bg-[#A7F3D0]/20 px-3 py-1 text-[11px] font-black text-[#A7F3D0]">
+                                  {activity.type}
+                                </span>
+                                <span className={`text-xs ${mutedText}`}>{activity.date}</span>
+                              </div>
+                              <h3 className="mt-2 font-black">{activity.title}</h3>
+                              {activity.note ? (
+                                <p className="mt-3 whitespace-pre-wrap text-sm leading-6">{activity.note}</p>
+                              ) : null}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+        ) : null}
+
+        {activeMenu === "tugas" ? (
+          <section className="grid gap-4 lg:grid-cols-[0.9fr_1.1fr]">
+            <div className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
+              <div className="mb-4">
+                <h2 className="text-xl font-black">Rencana Kerja</h2>
+                <p className={`text-sm ${mutedText}`}>Catat pekerjaan kecil yang akan dikerjakan untuk setiap project.</p>
               </div>
-            )}
+
+              <form onSubmit={saveTask} className="space-y-4">
+                <div>
+                  <label className={`mb-1 block text-xs font-bold ${mutedText}`}>Project</label>
+                  <select value={taskProjectId} onChange={(event) => setTaskProjectId(event.target.value)} className={inputClass}>
+                    <option value="">Pilih Project</option>
+                    {taskProjectOptions.map((project) => (
+                      <option key={project.id} value={project.id}>{project.title}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className={`mb-1 block text-xs font-bold ${mutedText}`}>Pekerjaan</label>
+                  <textarea value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} className={`${inputClass} min-h-24`} placeholder="Contoh: rapihkan filter report, cek data approval, follow up revisi..." />
+                </div>
+                <div>
+                  <label className={`mb-1 block text-xs font-bold ${mutedText}`}>Target Tanggal</label>
+                  <input type="date" value={taskDate} onChange={(event) => setTaskDate(event.target.value)} className={inputClass} />
+                </div>
+                <button disabled={isSavingTask} className="w-full rounded-2xl bg-[#A7F3D0] px-4 py-3 font-black text-[#111214] disabled:opacity-60">
+                  {isSavingTask ? "Menyimpan..." : "Simpan Rencana Kerja"}
+                </button>
+              </form>
+            </div>
+
+            <div className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-xl font-black">Pekerjaan Pending</h2>
+                  <p className={`text-sm ${mutedText}`}>{pendingTasks.length} pekerjaan belum selesai</p>
+                </div>
+                <button onClick={fetchProjects} className={`rounded-2xl border ${borderColor} px-3 py-2 text-sm font-bold`}>Refresh</button>
+              </div>
+
+              <div className="space-y-3">
+                {pendingTasks.length === 0 ? (
+                  <p className={mutedText}>Belum ada pekerjaan pending.</p>
+                ) : (
+                  pendingTasks.map((task) => {
+                    const project = projects.find((item) => item.id === task.projectId);
+
+                    return (
+                      <div key={task.id} className={`rounded-3xl border ${borderColor} ${softCardBg} p-4`}>
+                        <div className="flex items-start gap-3">
+                          <button
+                            type="button"
+                            onClick={() => toggleTaskDone(task)}
+                            className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[#A7F3D0] text-sm font-black text-[#A7F3D0]"
+                            title="Tandai selesai"
+                          >
+                            ✓
+                          </button>
+                          <div className="min-w-0 flex-1">
+                            <p className="whitespace-pre-wrap font-black leading-6">{task.title}</p>
+                            <p className={`mt-1 text-sm ${mutedText}`}>{project?.title ?? "Project tidak ditemukan"}</p>
+                            <p className={`mt-1 text-xs ${mutedText}`}>Target {task.taskDate}</p>
+                            <div className="mt-3 flex gap-2">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSelectedProjectId(task.projectId);
+                                  setActiveMenu("project");
+                                }}
+                                className="rounded-2xl bg-[#A7F3D0] px-3 py-2 text-xs font-black text-[#111214]"
+                              >
+                                Buka Project
+                              </button>
+                              <button type="button" onClick={() => deleteTask(task.id)} className="rounded-2xl bg-red-100 px-3 py-2 text-xs font-black text-red-700">
+                                Hapus
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+
+              {doneTasks.length > 0 ? (
+                <div className="mt-6 space-y-3">
+                  <h3 className="font-black">Selesai Terbaru</h3>
+                  {doneTasks.slice(0, 5).map((task) => {
+                    const project = projects.find((item) => item.id === task.projectId);
+
+                    return (
+                      <div key={task.id} className={`rounded-3xl border ${borderColor} ${softCardBg} p-4 opacity-80`}>
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <p className="font-black line-through">{task.title}</p>
+                            <p className={`mt-1 text-xs ${mutedText}`}>{project?.title ?? "Project tidak ditemukan"}</p>
+                          </div>
+                          <button type="button" onClick={() => toggleTaskDone(task)} className="text-xs font-bold text-[#A7F3D0]">Batal</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </div>
           </section>
         ) : null}
 
@@ -936,11 +1270,12 @@ export default function Home() {
       </section>
 
       <nav className={`fixed bottom-0 left-0 right-0 z-50 border-t ${borderColor} ${isDarkMode ? "bg-[#141518]/95" : "bg-white/95"} backdrop-blur`}>
-        <div className="mx-auto grid max-w-5xl grid-cols-5 gap-1 px-2 py-2">
+        <div className="mx-auto grid max-w-5xl grid-cols-6 gap-1 px-2 py-2">
           {[
             ["dashboard", "🏠", "Home"],
             ["tambah", "＋", "Tambah"],
             ["project", "🗂️", "Project"],
+            ["tugas", "☑️", "Tugas"],
             ["riwayat", "🧾", "Riwayat"],
             ["settings", "⚙️", "Set"],
           ].map(([id, icon, label]) => (
