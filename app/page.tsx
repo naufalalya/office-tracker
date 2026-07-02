@@ -48,6 +48,21 @@ type ProjectNote = {
   createdAtMillis: number;
 };
 
+type HistoryActivity = {
+  id: string;
+  type: "Project Dibuat" | "Project Selesai" | "Note Progress";
+  title: string;
+  projectId: string;
+  projectTitle: string;
+  client: string;
+  status: ProjectStatus;
+  priority: ProjectPriority;
+  activityDate: string;
+  description: string;
+  createdAtText: string;
+  createdAtMillis: number;
+};
+
 const statusOptions: ProjectStatus[] = [
   "Belum Mulai",
   "Proses",
@@ -182,6 +197,48 @@ export default function Home() {
     return daysLeft >= 0 && daysLeft <= 3;
   });
   const overdueProjects = activeProjects.filter((item) => getDaysLeft(item.deadlineDate) < 0);
+
+  const historyActivities = useMemo<HistoryActivity[]>(() => {
+    const projectMap = new Map(projects.map((project) => [project.id, project]));
+
+    const projectActivities = projects.map((project) => ({
+      id: `project-${project.id}`,
+      type: (project.status === "Selesai" ? "Project Selesai" : "Project Dibuat") as const,
+      title: project.status === "Selesai" ? "Project ditandai selesai" : "Project dibuat",
+      projectId: project.id,
+      projectTitle: project.title,
+      client: project.client,
+      status: project.status,
+      priority: project.priority,
+      activityDate: project.createdAtText,
+      description: project.notes || `Deadline ${project.deadlineDate}`,
+      createdAtText: project.createdAtText,
+      createdAtMillis: project.createdAtMillis,
+    }));
+
+    const noteActivities = notes.map((note) => {
+      const project = projectMap.get(note.projectId);
+
+      return {
+        id: `note-${note.id}`,
+        type: "Note Progress" as const,
+        title: "Note progress ditambahkan",
+        projectId: note.projectId,
+        projectTitle: project?.title ?? "Project tidak ditemukan",
+        client: project?.client ?? "",
+        status: project?.status ?? "Belum Mulai",
+        priority: project?.priority ?? "Normal",
+        activityDate: note.noteDate,
+        description: note.note,
+        createdAtText: note.createdAtText,
+        createdAtMillis: note.createdAtMillis,
+      };
+    });
+
+    return [...noteActivities, ...projectActivities].sort(
+      (a, b) => b.createdAtMillis - a.createdAtMillis
+    );
+  }, [projects, notes]);
 
   const resetForm = () => {
     setEditingProjectId("");
@@ -646,7 +703,7 @@ export default function Home() {
           </section>
         ) : null}
 
-        {activeMenu === "project" || activeMenu === "riwayat" ? (
+        {activeMenu === "project" ? (
           <section className="grid gap-4 lg:grid-cols-[1fr_1.1fr]">
             <div className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
               <div className="mb-4 flex items-center justify-between gap-3">
@@ -778,6 +835,87 @@ export default function Home() {
                 </div>
               )}
             </div>
+          </section>
+        ) : null}
+
+        {activeMenu === "riwayat" ? (
+          <section className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <h2 className="text-xl font-black">Riwayat Aktivitas</h2>
+                <p className={`text-sm ${mutedText}`}>
+                  Timeline semua update project dan note progress.
+                </p>
+              </div>
+              <button onClick={fetchProjects} className={`rounded-2xl border ${borderColor} px-3 py-2 text-sm font-bold`}>
+                Refresh
+              </button>
+            </div>
+
+            <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">
+              {[
+                ["Total Aktivitas", historyActivities.length],
+                ["Note Progress", notes.length],
+                ["Project Aktif", activeProjects.length],
+                ["Project Selesai", doneProjects.length],
+              ].map(([label, value]) => (
+                <div key={label} className={`rounded-[1.5rem] border ${borderColor} ${softCardBg} p-4`}>
+                  <p className={`text-xs font-bold ${mutedText}`}>{label}</p>
+                  <p className="mt-2 text-2xl font-black">{value}</p>
+                </div>
+              ))}
+            </div>
+
+            {historyActivities.length === 0 ? (
+              <p className={mutedText}>Belum ada riwayat aktivitas.</p>
+            ) : (
+              <div className="space-y-3">
+                {historyActivities.map((activity) => (
+                  <button
+                    key={activity.id}
+                    type="button"
+                    onClick={() => {
+                      if (activity.projectId) {
+                        setSelectedProjectId(activity.projectId);
+                        setActiveMenu("project");
+                      }
+                    }}
+                    className={`w-full rounded-3xl border ${borderColor} ${softCardBg} p-4 text-left transition hover:border-[#A7F3D0]`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="mb-2 flex flex-wrap items-center gap-2">
+                          <span className="rounded-full bg-[#A7F3D0] px-3 py-1 text-[10px] font-black text-[#111214]">
+                            {activity.type}
+                          </span>
+                          <span
+                            className={`rounded-full px-3 py-1 text-[10px] font-black ${
+                              activity.status === "Selesai"
+                                ? "bg-emerald-100 text-emerald-700"
+                                : activity.status === "Hold"
+                                ? "bg-neutral-200 text-neutral-700"
+                                : activity.status === "Menunggu"
+                                ? "bg-amber-100 text-amber-700"
+                                : "bg-blue-100 text-blue-700"
+                            }`}
+                          >
+                            {activity.status}
+                          </span>
+                          <span className={`text-xs ${mutedText}`}>{activity.priority}</span>
+                        </div>
+                        <h3 className="font-black">{activity.projectTitle}</h3>
+                        <p className={`mt-1 text-sm ${mutedText}`}>
+                          {activity.client || "Tanpa client/divisi"} · {activity.activityDate || activity.createdAtText}
+                        </p>
+                        <p className="mt-3 whitespace-pre-wrap text-sm leading-6">{activity.description}</p>
+                        <p className={`mt-2 text-xs ${mutedText}`}>Dicatat: {activity.createdAtText}</p>
+                      </div>
+                      <span className="shrink-0 text-xl">{activity.type === "Note Progress" ? "📝" : activity.type === "Project Selesai" ? "✅" : "🗂️"}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
           </section>
         ) : null}
 
