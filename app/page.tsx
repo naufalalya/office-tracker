@@ -23,7 +23,7 @@ import { auth, db } from "../lib/firebase";
 
 type ProjectStatus = "Belum Mulai" | "Proses" | "Menunggu" | "Hold" | "Selesai";
 type ProjectPriority = "Rendah" | "Normal" | "Penting" | "Urgent";
-type ActiveMenu = "dashboard" | "tambah" | "project" | "riwayat" | "tugas" | "settings";
+type ActiveMenu = "dashboard" | "tambah" | "project" | "riwayat" | "tugas" | "catatan" | "laporan" | "settings";
 
 type WorkProject = {
   id: string;
@@ -127,6 +127,7 @@ export default function Home() {
   const [isLoggingIn, setIsLoggingIn] = useState(false);
 
   const [activeMenu, setActiveMenu] = useState<ActiveMenu>("dashboard");
+  const [isNavigationMenuOpen, setIsNavigationMenuOpen] = useState(false);
   const [isDarkMode, setIsDarkMode] = useState(true);
 
   const [projects, setProjects] = useState<WorkProject[]>([]);
@@ -148,6 +149,13 @@ export default function Home() {
   const [noteText, setNoteText] = useState("");
   const [noteDate, setNoteDate] = useState(getTodayInputDate());
   const [isSavingNote, setIsSavingNote] = useState(false);
+
+  const [catatanProjectId, setCatatanProjectId] = useState("");
+  const [catatanText, setCatatanText] = useState("");
+  const [catatanDate, setCatatanDate] = useState(getTodayInputDate());
+  const [catatanSearch, setCatatanSearch] = useState("");
+  const [catatanFilterProjectId, setCatatanFilterProjectId] = useState("");
+  const [isSavingCatatan, setIsSavingCatatan] = useState(false);
 
   const [taskProjectId, setTaskProjectId] = useState("");
   const [taskTitle, setTaskTitle] = useState("");
@@ -323,6 +331,118 @@ export default function Home() {
     ? filteredActivityRows.filter((activity) => activity.projectId === selectedHistoryProject.id)
     : [];
 
+  const reportProjectRows = filteredProjects.map((project) => {
+    const projectTasks = tasks.filter((item) => item.projectId === project.id);
+    const projectNotes = notes.filter((item) => item.projectId === project.id);
+    const pendingCount = projectTasks.filter((item) => !item.isDone).length;
+    const doneCount = projectTasks.filter((item) => item.isDone).length;
+
+    return {
+      ...project,
+      deadlineLabel: getDeadlineLabel(project),
+      totalTasks: projectTasks.length,
+      pendingTasks: pendingCount,
+      doneTasks: doneCount,
+      totalNotes: projectNotes.length,
+    };
+  });
+
+  const reportTaskRows = tasks
+    .map((task) => {
+      const project = projects.find((item) => item.id === task.projectId);
+
+      return {
+        ...task,
+        projectTitle: project?.title ?? "Project tidak ditemukan",
+        client: project?.client ?? "",
+        projectStatus: project?.status ?? "Belum Mulai",
+        projectPriority: project?.priority ?? "Normal",
+      };
+    })
+    .filter((task) => {
+      const normalizedSearch = search.trim().toLowerCase();
+      const matchesSearch = normalizedSearch
+        ? [task.title, task.projectTitle, task.client, task.projectStatus, task.projectPriority]
+            .join(" ")
+            .toLowerCase()
+            .includes(normalizedSearch)
+        : true;
+      const matchesStatus = filterStatus ? task.projectStatus === filterStatus : true;
+      const matchesPriority = filterPriority ? task.projectPriority === filterPriority : true;
+
+      return matchesSearch && matchesStatus && matchesPriority;
+    })
+    .sort((a, b) => a.taskDate.localeCompare(b.taskDate));
+
+  const reportNoteRows = notes
+    .map((note) => {
+      const project = projects.find((item) => item.id === note.projectId);
+
+      return {
+        ...note,
+        projectTitle: project?.title ?? "Project tidak ditemukan",
+        client: project?.client ?? "",
+        projectStatus: project?.status ?? "Belum Mulai",
+        projectPriority: project?.priority ?? "Normal",
+      };
+    })
+    .filter((note) => {
+      const normalizedSearch = search.trim().toLowerCase();
+      const matchesSearch = normalizedSearch
+        ? [note.note, note.projectTitle, note.client, note.projectStatus, note.projectPriority]
+            .join(" ")
+            .toLowerCase()
+            .includes(normalizedSearch)
+        : true;
+      const matchesStatus = filterStatus ? note.projectStatus === filterStatus : true;
+      const matchesPriority = filterPriority ? note.projectPriority === filterPriority : true;
+
+      return matchesSearch && matchesStatus && matchesPriority;
+    })
+    .sort((a, b) => b.createdAtMillis - a.createdAtMillis);
+
+  const catatanRows = useMemo(() => {
+    const normalizedSearch = catatanSearch.trim().toLowerCase();
+
+    return notes
+      .map((note) => {
+        const project = projects.find((item) => item.id === note.projectId);
+
+        return {
+          ...note,
+          projectTitle: project?.title ?? "Project tidak ditemukan",
+          client: project?.client ?? "",
+          projectStatus: project?.status ?? "Belum Mulai",
+          projectPriority: project?.priority ?? "Normal",
+        };
+      })
+      .filter((note) => {
+        const matchesProject = catatanFilterProjectId ? note.projectId === catatanFilterProjectId : true;
+        const matchesSearch = normalizedSearch
+          ? [note.note, note.projectTitle, note.client, note.projectStatus, note.projectPriority, note.noteDate]
+              .join(" ")
+              .toLowerCase()
+              .includes(normalizedSearch)
+          : true;
+
+        return matchesProject && matchesSearch;
+      })
+      .sort((a, b) => b.createdAtMillis - a.createdAtMillis);
+  }, [notes, projects, catatanSearch, catatanFilterProjectId]);
+
+  const selectedCatatanProject = projects.find((item) => item.id === catatanProjectId) ?? null;
+
+  const reportSummaryRows = [
+    { label: "Total Project", value: filteredProjects.length },
+    { label: "Project Aktif", value: filteredProjects.filter((item) => item.status !== "Selesai").length },
+    { label: "Project Selesai", value: filteredProjects.filter((item) => item.status === "Selesai").length },
+    { label: "Deadline Dekat", value: filteredProjects.filter((item) => item.status !== "Selesai" && getDaysLeft(item.deadlineDate) >= 0 && getDaysLeft(item.deadlineDate) <= 3).length },
+    { label: "Lewat Deadline", value: filteredProjects.filter((item) => item.status !== "Selesai" && getDaysLeft(item.deadlineDate) < 0).length },
+    { label: "Tugas Pending", value: reportTaskRows.filter((item) => !item.isDone).length },
+    { label: "Tugas Selesai", value: reportTaskRows.filter((item) => item.isDone).length },
+    { label: "Total Note", value: reportNoteRows.length },
+  ];
+
   const resetForm = () => {
     setEditingProjectId("");
     setTitle("");
@@ -332,6 +452,15 @@ export default function Home() {
     setStatus("Belum Mulai");
     setPriority("Normal");
     setProjectNotes("");
+  };
+
+  const openMenuPage = (menuId: ActiveMenu) => {
+    setActiveMenu(menuId);
+    setIsNavigationMenuOpen(false);
+
+    window.setTimeout(() => {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }, 0);
   };
 
   const fetchProjects = async () => {
@@ -423,6 +552,10 @@ export default function Home() {
 
       if (!taskProjectId && mappedProjects.length > 0) {
         setTaskProjectId(mappedProjects[0].id);
+      }
+
+      if (!catatanProjectId && mappedProjects.length > 0) {
+        setCatatanProjectId(mappedProjects[0].id);
       }
 
       if (!selectedHistoryProjectId && mappedProjects.length > 0) {
@@ -612,6 +745,50 @@ export default function Home() {
     }
   };
 
+  const saveCatatan = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    if (!currentUser) {
+      alert("Login dulu ya.");
+      return;
+    }
+
+    const targetProject = projects.find((item) => item.id === catatanProjectId);
+
+    if (!targetProject) {
+      alert("Pilih project untuk catatan ini dulu ya.");
+      return;
+    }
+
+    if (!catatanText.trim()) {
+      alert("Isi catatan dulu ya.");
+      return;
+    }
+
+    try {
+      setIsSavingCatatan(true);
+
+      await addDoc(collection(db, "workProjectNotes"), {
+        userId: currentUser.uid,
+        projectId: targetProject.id,
+        projectTitle: targetProject.title,
+        noteDate: catatanDate,
+        note: catatanText.trim(),
+        createdAt: serverTimestamp(),
+      });
+
+      setCatatanText("");
+      setCatatanDate(getTodayInputDate());
+      await fetchProjects();
+      alert("Catatan berhasil disimpan.");
+    } catch (error) {
+      console.error(error);
+      alert("Gagal menyimpan catatan.");
+    } finally {
+      setIsSavingCatatan(false);
+    }
+  };
+
   const saveTask = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
@@ -680,6 +857,290 @@ export default function Home() {
     }
   };
 
+  const escapeReportCell = (value: unknown) => {
+    return String(value ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/\"/g, "&quot;");
+  };
+
+  const buildExcelWorksheet = (name: string, rows: (string | number | boolean | null | undefined)[][]) => {
+    const safeName = escapeReportCell(name);
+    const tableRows = rows
+      .map((row, rowIndex) => {
+        const cells = row
+          .map((cell) => {
+            const isNumber = typeof cell === "number" && Number.isFinite(cell);
+            const styleAttribute = rowIndex === 0 ? ' ss:StyleID="Header"' : "";
+            return `<Cell${styleAttribute}><Data ss:Type="${isNumber ? "Number" : "String"}">${escapeReportCell(cell)}</Data></Cell>`;
+          })
+          .join("");
+
+        return `<Row>${cells}</Row>`;
+      })
+      .join("");
+
+    return `<Worksheet ss:Name="${safeName}"><Table>${tableRows}</Table></Worksheet>`;
+  };
+
+  const exportExcelReport = () => {
+    const generatedAt = new Date().toLocaleString("id-ID", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+
+    const excelStyles = `
+      <Styles>
+        <Style ss:ID="Header">
+          <Font ss:Bold="1"/>
+          <Interior ss:Color="#E5E7EB" ss:Pattern="Solid"/>
+        </Style>
+      </Styles>`;
+
+    const worksheets = [
+      buildExcelWorksheet("Ringkasan", [
+        ["Office Tracker"],
+        ["User", username],
+        ["Dibuat", generatedAt],
+        ["Filter Search", search || "Semua"],
+        ["Filter Status", filterStatus || "Semua"],
+        ["Filter Prioritas", filterPriority || "Semua"],
+        [],
+        ["Metrik", "Jumlah"],
+        ...reportSummaryRows.map((row) => [row.label, row.value]),
+      ]),
+      buildExcelWorksheet("Project", [
+        ["Nama Project", "Client/Divisi", "Tanggal Masuk", "Deadline", "Status", "Prioritas", "Deadline Info", "Total Tugas", "Pending", "Selesai", "Total Note", "Note Awal"],
+        ...reportProjectRows.map((project) => [
+          project.title,
+          project.client || "-",
+          project.masukDate,
+          project.deadlineDate,
+          project.status,
+          project.priority,
+          project.deadlineLabel,
+          project.totalTasks,
+          project.pendingTasks,
+          project.doneTasks,
+          project.totalNotes,
+          project.notes || "-",
+        ]),
+      ]),
+      buildExcelWorksheet("Tugas", [
+        ["Target Tanggal", "Project", "Client/Divisi", "Pekerjaan", "Status Tugas", "Status Project", "Prioritas Project", "Dibuat"],
+        ...reportTaskRows.map((task) => [
+          task.taskDate,
+          task.projectTitle,
+          task.client || "-",
+          task.title,
+          task.isDone ? "Selesai" : "Pending",
+          task.projectStatus,
+          task.projectPriority,
+          task.createdAtText,
+        ]),
+      ]),
+      buildExcelWorksheet("Note Progress", [
+        ["Tanggal Note", "Project", "Client/Divisi", "Note", "Status Project", "Prioritas Project", "Dibuat"],
+        ...reportNoteRows.map((note) => [
+          note.noteDate,
+          note.projectTitle,
+          note.client || "-",
+          note.note,
+          note.projectStatus,
+          note.projectPriority,
+          note.createdAtText,
+        ]),
+      ]),
+      buildExcelWorksheet("Riwayat", [
+        ["Tanggal", "Jenis Aktivitas", "Project", "Client/Divisi", "Judul", "Catatan", "Status", "Prioritas"],
+        ...filteredActivityRows.map((activity) => [
+          activity.date,
+          activity.type,
+          activity.projectTitle,
+          activity.client || "-",
+          activity.title,
+          activity.note || "-",
+          activity.status,
+          activity.priority,
+        ]),
+      ]),
+    ];
+
+    const workbook = `<?xml version="1.0"?>
+<?mso-application progid="Excel.Sheet"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+  xmlns:o="urn:schemas-microsoft-com:office:office"
+  xmlns:x="urn:schemas-microsoft-com:office:excel"
+  xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+  ${excelStyles}
+  ${worksheets.join("\n")}
+</Workbook>`;
+
+    const blob = new Blob([workbook], {
+      type: "application/vnd.ms-excel;charset=utf-8;",
+    });
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `office-tracker-report-${getTodayInputDate()}.xls`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const printReport = () => {
+    const generatedAt = new Date().toLocaleString("id-ID", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+
+    const summaryCards = reportSummaryRows
+      .map(
+        (row) => `
+          <div class="summary-card">
+            <div class="summary-label">${escapeReportCell(row.label)}</div>
+            <div class="summary-value">${escapeReportCell(row.value)}</div>
+          </div>
+        `
+      )
+      .join("");
+
+    const projectRows = reportProjectRows
+      .map(
+        (project) => `
+          <tr>
+            <td>${escapeReportCell(project.title)}</td>
+            <td>${escapeReportCell(project.client || "-")}</td>
+            <td>${escapeReportCell(project.masukDate)}</td>
+            <td>${escapeReportCell(project.deadlineDate)}</td>
+            <td>${escapeReportCell(project.status)}</td>
+            <td>${escapeReportCell(project.priority)}</td>
+            <td>${escapeReportCell(project.deadlineLabel)}</td>
+            <td class="number">${escapeReportCell(project.pendingTasks)}/${escapeReportCell(project.totalTasks)}</td>
+            <td class="number">${escapeReportCell(project.totalNotes)}</td>
+          </tr>
+        `
+      )
+      .join("");
+
+    const taskRows = reportTaskRows
+      .map(
+        (task) => `
+          <tr>
+            <td>${escapeReportCell(task.taskDate)}</td>
+            <td>${escapeReportCell(task.projectTitle)}</td>
+            <td>${escapeReportCell(task.title)}</td>
+            <td>${escapeReportCell(task.isDone ? "Selesai" : "Pending")}</td>
+            <td>${escapeReportCell(task.projectStatus)}</td>
+            <td>${escapeReportCell(task.projectPriority)}</td>
+          </tr>
+        `
+      )
+      .join("");
+
+    const noteRows = reportNoteRows
+      .map(
+        (note) => `
+          <tr>
+            <td>${escapeReportCell(note.noteDate)}</td>
+            <td>${escapeReportCell(note.projectTitle)}</td>
+            <td>${escapeReportCell(note.note)}</td>
+            <td>${escapeReportCell(note.projectStatus)}</td>
+            <td>${escapeReportCell(note.projectPriority)}</td>
+          </tr>
+        `
+      )
+      .join("");
+
+    const html = `
+      <!doctype html>
+      <html lang="id">
+        <head>
+          <meta charset="utf-8" />
+          <title>Laporan Office Tracker</title>
+          <style>
+            @page { size: A4; margin: 14mm; }
+            * { box-sizing: border-box; }
+            body { margin: 0; color: #111827; font-family: Arial, Helvetica, sans-serif; background: #fff; font-size: 12px; }
+            .header { display: flex; justify-content: space-between; gap: 16px; border-bottom: 2px solid #111827; padding-bottom: 12px; margin-bottom: 14px; }
+            .app-name { font-size: 11px; color: #6b7280; margin: 0 0 4px; }
+            h1 { font-size: 22px; margin: 0; }
+            h2 { font-size: 15px; margin: 18px 0 8px; }
+            .meta { text-align: right; color: #374151; line-height: 1.6; }
+            .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 14px 0; }
+            .summary-card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 10px; background: #f9fafb; }
+            .summary-label { color: #6b7280; font-size: 10px; margin-bottom: 5px; }
+            .summary-value { font-weight: 800; font-size: 17px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+            thead { display: table-header-group; }
+            th { text-align: left; background: #111827; color: #fff; padding: 8px; font-size: 10px; border: 1px solid #111827; }
+            td { padding: 7px; border: 1px solid #e5e7eb; vertical-align: top; }
+            .number { text-align: right; white-space: nowrap; }
+            .print-actions { position: fixed; right: 16px; bottom: 16px; display: flex; gap: 8px; }
+            .print-actions button { border: 0; border-radius: 999px; background: #111827; color: #fff; padding: 10px 14px; cursor: pointer; font-weight: 800; }
+            @media print { .print-actions { display: none; } body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <div>
+              <p class="app-name">Office Tracker</p>
+              <h1>Laporan Project Kerja</h1>
+            </div>
+            <div class="meta">
+              <div><b>${escapeReportCell(username)}</b></div>
+              <div>Dibuat: ${escapeReportCell(generatedAt)}</div>
+              <div>Filter: ${escapeReportCell([search ? `Cari ${search}` : "", filterStatus ? `Status ${filterStatus}` : "", filterPriority ? `Prioritas ${filterPriority}` : ""].filter(Boolean).join(" · ") || "Semua data")}</div>
+            </div>
+          </div>
+
+          <div class="summary-grid">${summaryCards}</div>
+
+          <h2>Daftar Project</h2>
+          <table>
+            <thead>
+              <tr><th>Project</th><th>Client/Divisi</th><th>Masuk</th><th>Deadline</th><th>Status</th><th>Prioritas</th><th>Info</th><th>Tugas</th><th>Note</th></tr>
+            </thead>
+            <tbody>${projectRows || `<tr><td colspan="9">Belum ada project.</td></tr>`}</tbody>
+          </table>
+
+          <h2>Daftar Tugas</h2>
+          <table>
+            <thead>
+              <tr><th>Target</th><th>Project</th><th>Pekerjaan</th><th>Status Tugas</th><th>Status Project</th><th>Prioritas</th></tr>
+            </thead>
+            <tbody>${taskRows || `<tr><td colspan="6">Belum ada tugas.</td></tr>`}</tbody>
+          </table>
+
+          <h2>Note Progress</h2>
+          <table>
+            <thead>
+              <tr><th>Tanggal</th><th>Project</th><th>Note</th><th>Status Project</th><th>Prioritas</th></tr>
+            </thead>
+            <tbody>${noteRows || `<tr><td colspan="5">Belum ada note.</td></tr>`}</tbody>
+          </table>
+
+          <div class="print-actions">
+            <button onclick="window.print()">Cetak / Simpan PDF</button>
+            <button onclick="window.close()">Tutup</button>
+          </div>
+        </body>
+      </html>
+    `;
+
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      alert("Popup diblokir browser. Izinkan popup dulu ya.");
+      return;
+    }
+
+    printWindow.document.open();
+    printWindow.document.write(html);
+    printWindow.document.close();
+    printWindow.focus();
+  };
+
   if (isCheckingAuth) {
     return <main className={`min-h-screen ${pageBg} p-6`}>Loading...</main>;
   }
@@ -738,7 +1199,7 @@ export default function Home() {
             <div>
               <p className={`text-xs font-bold uppercase tracking-wide ${mutedText}`}>Office Tracker</p>
               <h1 className="mt-1 text-2xl font-black">Hai, {username}</h1>
-              <p className={`mt-1 text-sm ${mutedText}`}>Project kantor, deadline, dan note kerjaan.</p>
+              <p className={`mt-1 text-sm ${mutedText}`}>Project kantor, deadline, tugas, dan catatan kerjaan.</p>
             </div>
             <div className="flex gap-2">
               <button
@@ -1253,6 +1714,193 @@ export default function Home() {
           </section>
         ) : null}
 
+        {activeMenu === "catatan" ? (
+          <section className="grid gap-4 lg:grid-cols-[0.9fr_1.1fr]">
+            <div className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
+              <div className="mb-4">
+                <h2 className="text-xl font-black">Catatan</h2>
+                <p className={`text-sm ${mutedText}`}>Catat hal penting, progress, link, atau reminder kecil tanpa membuka detail project.</p>
+              </div>
+
+              <form onSubmit={saveCatatan} className="space-y-4">
+                <div>
+                  <label className={`mb-1 block text-xs font-bold ${mutedText}`}>Project</label>
+                  <select value={catatanProjectId} onChange={(event) => setCatatanProjectId(event.target.value)} className={inputClass}>
+                    <option value="">Pilih Project</option>
+                    {projects.map((project) => (
+                      <option key={project.id} value={project.id}>{project.title}</option>
+                    ))}
+                  </select>
+                  {selectedCatatanProject ? (
+                    <p className={`mt-1 text-xs ${mutedText}`}>{selectedCatatanProject.client || "Tanpa client/divisi"} · {selectedCatatanProject.status}</p>
+                  ) : null}
+                </div>
+                <div>
+                  <label className={`mb-1 block text-xs font-bold ${mutedText}`}>Tanggal Catatan</label>
+                  <input type="date" value={catatanDate} onChange={(event) => setCatatanDate(event.target.value)} className={inputClass} />
+                </div>
+                <div>
+                  <label className={`mb-1 block text-xs font-bold ${mutedText}`}>Isi Catatan</label>
+                  <textarea
+                    value={catatanText}
+                    onChange={(event) => setCatatanText(event.target.value)}
+                    className={`${inputClass} min-h-36`}
+                    placeholder="Contoh: masih tunggu data dari user, link deploy, catatan revisi, atau reminder follow up..."
+                  />
+                </div>
+                <button disabled={isSavingCatatan} className="w-full rounded-2xl bg-[#A7F3D0] px-4 py-3 font-black text-[#111214] disabled:opacity-60">
+                  {isSavingCatatan ? "Menyimpan..." : "Simpan Catatan"}
+                </button>
+              </form>
+            </div>
+
+            <div className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
+              <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                <div>
+                  <h2 className="text-xl font-black">Daftar Catatan</h2>
+                  <p className={`text-sm ${mutedText}`}>{catatanRows.length} catatan tampil dari {notes.length} total catatan</p>
+                </div>
+                <button type="button" onClick={fetchProjects} className={`rounded-2xl border ${borderColor} px-3 py-2 text-sm font-bold`}>Refresh</button>
+              </div>
+
+              <div className="mb-4 grid gap-2 md:grid-cols-[1.2fr_1fr]">
+                <input value={catatanSearch} onChange={(event) => setCatatanSearch(event.target.value)} className={inputClass} placeholder="Cari isi catatan/project/client" />
+                <select value={catatanFilterProjectId} onChange={(event) => setCatatanFilterProjectId(event.target.value)} className={inputClass}>
+                  <option value="">Semua Project</option>
+                  {projects.map((project) => (
+                    <option key={project.id} value={project.id}>{project.title}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="space-y-3">
+                {catatanRows.length === 0 ? (
+                  <div className={`rounded-3xl border ${borderColor} ${softCardBg} p-5 text-center`}>
+                    <p className="font-black">Belum ada catatan.</p>
+                    <p className={`mt-1 text-sm ${mutedText}`}>Catatan yang kamu simpan akan muncul di sini.</p>
+                  </div>
+                ) : (
+                  catatanRows.map((note) => (
+                    <div key={note.id} className={`rounded-3xl border ${borderColor} ${softCardBg} p-4`}>
+                      <div className="mb-3 flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate font-black">{note.projectTitle}</p>
+                          <p className={`mt-1 text-xs ${mutedText}`}>{note.client || "Tanpa client/divisi"} · {note.noteDate}</p>
+                        </div>
+                        <button type="button" onClick={() => deleteNote(note.id)} className="shrink-0 rounded-2xl bg-red-100 px-3 py-2 text-xs font-black text-red-700">
+                          Hapus
+                        </button>
+                      </div>
+                      <p className="whitespace-pre-wrap text-sm leading-6">{note.note}</p>
+                      <div className="mt-3 flex flex-wrap items-center gap-2 text-xs font-bold">
+                        <span className="rounded-full bg-[#A7F3D0]/20 px-3 py-1 text-[#A7F3D0]">{note.projectStatus}</span>
+                        <span className={`rounded-full ${softCardBg} px-3 py-1`}>{note.projectPriority}</span>
+                        <span className={`rounded-full ${softCardBg} px-3 py-1`}>{note.createdAtText}</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedProjectId(note.projectId);
+                            setActiveMenu("project");
+                          }}
+                          className="rounded-full bg-[#A7F3D0] px-3 py-1 text-[#111214]"
+                        >
+                          Buka Project
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </section>
+        ) : null}
+
+        {activeMenu === "laporan" ? (
+          <section className="space-y-4">
+            <div className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
+              <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                <div>
+                  <h2 className="text-xl font-black">Laporan Kerjaan</h2>
+                  <p className={`mt-1 text-sm ${mutedText}`}>Ringkasan project, tugas, note progress, dan riwayat aktivitas.</p>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <button
+                    type="button"
+                    onClick={exportExcelReport}
+                    className="rounded-2xl bg-[#A7F3D0] px-4 py-3 text-sm font-black text-[#111214]"
+                  >
+                    Export Excel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={printReport}
+                    className={`rounded-2xl border ${borderColor} ${softCardBg} px-4 py-3 text-sm font-black`}
+                  >
+                    Cetak / PDF
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-4 grid gap-2 md:grid-cols-[1.4fr_1fr_1fr]">
+                <input value={search} onChange={(event) => setSearch(event.target.value)} className={inputClass} placeholder="Cari project/client/note/tugas" />
+                <select value={filterStatus} onChange={(event) => setFilterStatus(event.target.value as ProjectStatus | "")} className={inputClass}>
+                  <option value="">Semua Status</option>
+                  {statusOptions.map((item) => <option key={item}>{item}</option>)}
+                </select>
+                <select value={filterPriority} onChange={(event) => setFilterPriority(event.target.value as ProjectPriority | "")} className={inputClass}>
+                  <option value="">Semua Prioritas</option>
+                  {priorityOptions.map((item) => <option key={item}>{item}</option>)}
+                </select>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              {reportSummaryRows.map((row) => (
+                <div key={row.label} className={`rounded-[1.5rem] border ${borderColor} ${cardBg} p-4`}>
+                  <p className={`text-xs font-bold ${mutedText}`}>{row.label}</p>
+                  <p className="mt-2 text-3xl font-black">{row.value}</p>
+                </div>
+              ))}
+            </div>
+
+            <div className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-lg font-black">Preview Project</h3>
+                  <p className={`text-sm ${mutedText}`}>{reportProjectRows.length} project sesuai filter.</p>
+                </div>
+                <button type="button" onClick={fetchProjects} className={`rounded-2xl border ${borderColor} px-3 py-2 text-sm font-bold`}>Refresh</button>
+              </div>
+
+              <div className="space-y-3">
+                {reportProjectRows.length === 0 ? (
+                  <p className={mutedText}>Belum ada data laporan.</p>
+                ) : (
+                  reportProjectRows.slice(0, 8).map((project) => (
+                    <div key={project.id} className={`rounded-3xl border ${borderColor} ${softCardBg} p-4`}>
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <h4 className="truncate font-black">{project.title}</h4>
+                          <p className={`mt-1 text-sm ${mutedText}`}>{project.client || "Tanpa client/divisi"}</p>
+                          <p className={`mt-1 text-xs ${mutedText}`}>Masuk {project.masukDate} · Deadline {project.deadlineDate}</p>
+                          <div className="mt-2 flex flex-wrap gap-2 text-xs font-bold">
+                            <span className={`rounded-full ${softCardBg} px-3 py-1`}>{project.pendingTasks}/{project.totalTasks} tugas pending</span>
+                            <span className={`rounded-full ${softCardBg} px-3 py-1`}>{project.totalNotes} note</span>
+                            <span className={`rounded-full ${softCardBg} px-3 py-1`}>{project.priority}</span>
+                          </div>
+                        </div>
+                        <span className={`shrink-0 rounded-full px-3 py-1 text-xs font-black ${getDeadlineClass(project)}`}>
+                          {project.deadlineLabel}
+                        </span>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </section>
+        ) : null}
+
         {activeMenu === "settings" ? (
           <section className={`rounded-[2rem] border ${borderColor} ${cardBg} p-5`}>
             <h2 className="text-xl font-black">Settings</h2>
@@ -1269,20 +1917,72 @@ export default function Home() {
         ) : null}
       </section>
 
-      <nav className={`fixed bottom-0 left-0 right-0 z-50 border-t ${borderColor} ${isDarkMode ? "bg-[#141518]/95" : "bg-white/95"} backdrop-blur`}>
-        <div className="mx-auto grid max-w-5xl grid-cols-6 gap-1 px-2 py-2">
+      {isNavigationMenuOpen ? (
+        <div className="fixed inset-0 z-[70] bg-black/35 px-3 pb-24 backdrop-blur-sm" onClick={() => setIsNavigationMenuOpen(false)}>
+          <div
+            onClick={(event) => event.stopPropagation()}
+            className={`absolute bottom-24 left-3 right-3 mx-auto max-w-3xl rounded-[2rem] border ${borderColor} ${cardBg} p-4 shadow-2xl md:bottom-28 md:p-5`}
+          >
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div>
+                <p className={`text-xs font-bold uppercase tracking-wide ${mutedText}`}>Menu</p>
+                <h2 className="mt-1 text-xl font-black">Pilih halaman</h2>
+                <p className={`mt-1 text-sm ${mutedText}`}>Menu dibuat ringkas supaya nyaman di HP, tablet, dan laptop.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsNavigationMenuOpen(false)}
+                className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border ${borderColor} ${softCardBg} text-lg font-black`}
+                aria-label="Tutup menu"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+              {[
+                ["dashboard", "🏠", "Dashboard", "Ringkasan deadline"],
+                ["tambah", "＋", "Tambah", "Input project baru"],
+                ["project", "🗂️", "Project", "Detail project"],
+                ["tugas", "☑️", "Tugas", "Pekerjaan pending"],
+                ["catatan", "📝", "Catatan", "Notes terpisah"],
+                ["riwayat", "🧾", "Riwayat", "Aktivitas per project"],
+                ["laporan", "📊", "Laporan", "Excel dan PDF"],
+                ["settings", "⚙️", "Settings", "Mode dan logout"],
+              ].map(([id, icon, label, description]) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => openMenuPage(id as ActiveMenu)}
+                  className={`rounded-3xl border p-4 text-left transition ${
+                    activeMenu === id
+                      ? "border-[#A7F3D0] bg-[#A7F3D0]/10"
+                      : `${borderColor} ${softCardBg}`
+                  }`}
+                >
+                  <div className="text-2xl">{icon}</div>
+                  <p className="mt-2 font-black">{label}</p>
+                  <p className={`mt-1 text-xs ${mutedText}`}>{description}</p>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <nav className={`fixed bottom-0 left-0 right-0 z-[60] border-t ${borderColor} ${isDarkMode ? "bg-[#141518]/95" : "bg-white/95"} pb-[env(safe-area-inset-bottom)] backdrop-blur`}>
+        <div className="mx-auto grid max-w-3xl grid-cols-5 gap-1 px-2 py-2 md:px-4">
           {[
             ["dashboard", "🏠", "Home"],
             ["tambah", "＋", "Tambah"],
             ["project", "🗂️", "Project"],
             ["tugas", "☑️", "Tugas"],
-            ["riwayat", "🧾", "Riwayat"],
-            ["settings", "⚙️", "Set"],
           ].map(([id, icon, label]) => (
             <button
               key={id}
-              onClick={() => setActiveMenu(id as ActiveMenu)}
-              className={`rounded-2xl px-2 py-2 text-xs font-black transition ${
+              type="button"
+              onClick={() => openMenuPage(id as ActiveMenu)}
+              className={`rounded-2xl px-2 py-2 text-xs font-black transition md:py-3 ${
                 activeMenu === id
                   ? "bg-[#A7F3D0] text-[#111214]"
                   : isDarkMode
@@ -1290,10 +1990,25 @@ export default function Home() {
                   : "text-neutral-500"
               }`}
             >
-              <div className="text-lg">{icon}</div>
-              {label}
+              <div className="text-lg md:text-xl">{icon}</div>
+              <span className="text-[10px] sm:text-xs">{label}</span>
             </button>
           ))}
+
+          <button
+            type="button"
+            onClick={() => setIsNavigationMenuOpen((current) => !current)}
+            className={`rounded-2xl px-2 py-2 text-xs font-black transition md:py-3 ${
+              isNavigationMenuOpen || ["catatan", "riwayat", "laporan", "settings"].includes(activeMenu)
+                ? "bg-[#A7F3D0] text-[#111214]"
+                : isDarkMode
+                ? "text-[#B8BDC7]"
+                : "text-neutral-500"
+            }`}
+          >
+            <div className="text-lg md:text-xl">☰</div>
+            <span className="text-[10px] sm:text-xs">Menu</span>
+          </button>
         </div>
       </nav>
     </main>
