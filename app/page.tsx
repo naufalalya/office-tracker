@@ -95,16 +95,34 @@ const formatDateTime = (value: unknown) => {
   return "-";
 };
 
-const getDaysLeft = (deadlineDate: string) => {
+const getDaysLeft = (deadlineDate?: string) => {
+  if (!deadlineDate) return null;
+
   const today = new Date(getTodayInputDate()).getTime();
   const deadline = new Date(deadlineDate).getTime();
+
+  if (!Number.isFinite(deadline)) return null;
+
   return Math.ceil((deadline - today) / 86400000);
+};
+
+const getDeadlineSortValue = (deadlineDate?: string) => {
+  if (!deadlineDate) return Number.MAX_SAFE_INTEGER;
+
+  const value = new Date(deadlineDate).getTime();
+  return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
+};
+
+const formatDeadlineDate = (deadlineDate?: string) => {
+  return deadlineDate ? deadlineDate : "Belum ada deadline";
 };
 
 const getDeadlineLabel = (project: WorkProject) => {
   if (project.status === "Selesai") return "Selesai";
+  if (!project.deadlineDate) return "Tanpa deadline";
 
   const daysLeft = getDaysLeft(project.deadlineDate);
+  if (daysLeft === null) return "Tanpa deadline";
   if (daysLeft < 0) return `Lewat ${Math.abs(daysLeft)} hari`;
   if (daysLeft === 0) return "Deadline hari ini";
   return `H-${daysLeft}`;
@@ -112,8 +130,10 @@ const getDeadlineLabel = (project: WorkProject) => {
 
 const getDeadlineClass = (project: WorkProject) => {
   if (project.status === "Selesai") return "bg-emerald-100 text-emerald-700";
+  if (!project.deadlineDate) return "bg-neutral-100 text-neutral-700";
 
   const daysLeft = getDaysLeft(project.deadlineDate);
+  if (daysLeft === null) return "bg-neutral-100 text-neutral-700";
   if (daysLeft < 0) return "bg-red-100 text-red-700";
   if (daysLeft <= 3) return "bg-amber-100 text-amber-700";
   return "bg-blue-100 text-blue-700";
@@ -141,7 +161,7 @@ export default function Home() {
   const [title, setTitle] = useState("");
   const [client, setClient] = useState("");
   const [masukDate, setMasukDate] = useState(getTodayInputDate());
-  const [deadlineDate, setDeadlineDate] = useState(getTodayInputDate());
+  const [deadlineDate, setDeadlineDate] = useState("");
   const [status, setStatus] = useState<ProjectStatus>("Belum Mulai");
   const [priority, setPriority] = useState<ProjectPriority>("Normal");
   const [projectNotes, setProjectNotes] = useState("");
@@ -213,11 +233,16 @@ export default function Home() {
 
   const activeProjects = projects.filter((item) => item.status !== "Selesai");
   const doneProjects = projects.filter((item) => item.status === "Selesai");
-  const nearDeadlineProjects = activeProjects.filter((item) => {
+  const projectsWithDeadline = activeProjects.filter((item) => Boolean(item.deadlineDate));
+  const projectsWithoutDeadline = activeProjects.filter((item) => !item.deadlineDate);
+  const nearDeadlineProjects = projectsWithDeadline.filter((item) => {
     const daysLeft = getDaysLeft(item.deadlineDate);
-    return daysLeft >= 0 && daysLeft <= 3;
+    return daysLeft !== null && daysLeft >= 0 && daysLeft <= 3;
   });
-  const overdueProjects = activeProjects.filter((item) => getDaysLeft(item.deadlineDate) < 0);
+  const overdueProjects = projectsWithDeadline.filter((item) => {
+    const daysLeft = getDaysLeft(item.deadlineDate);
+    return daysLeft !== null && daysLeft < 0;
+  });
 
   const activityRows = useMemo(() => {
     const projectActivities = projects.map((project) => ({
@@ -436,8 +461,8 @@ export default function Home() {
     { label: "Total Project", value: filteredProjects.length },
     { label: "Project Aktif", value: filteredProjects.filter((item) => item.status !== "Selesai").length },
     { label: "Project Selesai", value: filteredProjects.filter((item) => item.status === "Selesai").length },
-    { label: "Deadline Dekat", value: filteredProjects.filter((item) => item.status !== "Selesai" && getDaysLeft(item.deadlineDate) >= 0 && getDaysLeft(item.deadlineDate) <= 3).length },
-    { label: "Lewat Deadline", value: filteredProjects.filter((item) => item.status !== "Selesai" && getDaysLeft(item.deadlineDate) < 0).length },
+    { label: "Deadline Dekat", value: filteredProjects.filter((item) => { const daysLeft = getDaysLeft(item.deadlineDate); return item.status !== "Selesai" && daysLeft !== null && daysLeft >= 0 && daysLeft <= 3; }).length },
+    { label: "Lewat Deadline", value: filteredProjects.filter((item) => { const daysLeft = getDaysLeft(item.deadlineDate); return item.status !== "Selesai" && daysLeft !== null && daysLeft < 0; }).length },
     { label: "Tugas Pending", value: reportTaskRows.filter((item) => !item.isDone).length },
     { label: "Tugas Selesai", value: reportTaskRows.filter((item) => item.isDone).length },
     { label: "Total Note", value: reportNoteRows.length },
@@ -448,7 +473,7 @@ export default function Home() {
     setTitle("");
     setClient("");
     setMasukDate(getTodayInputDate());
-    setDeadlineDate(getTodayInputDate());
+    setDeadlineDate("");
     setStatus("Belum Mulai");
     setPriority("Normal");
     setProjectNotes("");
@@ -508,7 +533,7 @@ export default function Home() {
             createdAtMillis: data.createdAt instanceof Timestamp ? data.createdAt.toMillis() : 0,
           };
         })
-        .sort((a, b) => a.deadlineDate.localeCompare(b.deadlineDate));
+        .sort((a, b) => getDeadlineSortValue(a.deadlineDate) - getDeadlineSortValue(b.deadlineDate));
 
       const mappedNotes = noteSnapshot.docs
         .map((item) => {
@@ -622,11 +647,6 @@ export default function Home() {
       return;
     }
 
-    if (!deadlineDate) {
-      alert("Deadline wajib diisi.");
-      return;
-    }
-
     try {
       setIsSaving(true);
 
@@ -635,7 +655,7 @@ export default function Home() {
         title: title.trim(),
         client: client.trim(),
         masukDate,
-        deadlineDate,
+        deadlineDate: deadlineDate || "",
         status,
         priority,
         notes: projectNotes.trim(),
@@ -916,7 +936,7 @@ export default function Home() {
           project.title,
           project.client || "-",
           project.masukDate,
-          project.deadlineDate,
+          formatDeadlineDate(project.deadlineDate),
           project.status,
           project.priority,
           project.deadlineLabel,
@@ -1013,7 +1033,7 @@ export default function Home() {
             <td>${escapeReportCell(project.title)}</td>
             <td>${escapeReportCell(project.client || "-")}</td>
             <td>${escapeReportCell(project.masukDate)}</td>
-            <td>${escapeReportCell(project.deadlineDate)}</td>
+            <td>${escapeReportCell(formatDeadlineDate(project.deadlineDate))}</td>
             <td>${escapeReportCell(project.status)}</td>
             <td>${escapeReportCell(project.priority)}</td>
             <td>${escapeReportCell(project.deadlineLabel)}</td>
@@ -1220,12 +1240,13 @@ export default function Home() {
 
         {activeMenu === "dashboard" ? (
           <div className="space-y-4">
-            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
               {[
                 ["Project Aktif", activeProjects.length],
                 ["Deadline Dekat", nearDeadlineProjects.length],
                 ["Lewat Deadline", overdueProjects.length],
                 ["Tugas Pending", pendingTasks.length],
+                ["Tanpa Deadline", projectsWithoutDeadline.length],
               ].map(([label, value]) => (
                 <div key={label} className={`rounded-[1.5rem] border ${borderColor} ${cardBg} p-4`}>
                   <p className={`text-xs font-bold ${mutedText}`}>{label}</p>
@@ -1255,7 +1276,7 @@ export default function Home() {
               ) : (
                 <div className="space-y-3">
                   {[...activeProjects]
-                    .sort((a, b) => a.deadlineDate.localeCompare(b.deadlineDate))
+                    .sort((a, b) => getDeadlineSortValue(a.deadlineDate) - getDeadlineSortValue(b.deadlineDate))
                     .slice(0, 5)
                     .map((project) => (
                       <button
@@ -1270,7 +1291,7 @@ export default function Home() {
                           <div>
                             <h3 className="font-black">{project.title}</h3>
                             <p className={`mt-1 text-sm ${mutedText}`}>{project.client || "Tanpa client/divisi"}</p>
-                            <p className={`mt-1 text-xs ${mutedText}`}>Masuk {project.masukDate} · Deadline {project.deadlineDate}</p>
+                            <p className={`mt-1 text-xs ${mutedText}`}>Masuk {project.masukDate} · Deadline {formatDeadlineDate(project.deadlineDate)}</p>
                           </div>
                           <span className={`shrink-0 rounded-full px-3 py-1 text-xs font-black ${getDeadlineClass(project)}`}>
                             {getDeadlineLabel(project)}
@@ -1289,7 +1310,7 @@ export default function Home() {
             <div className="mb-4 flex items-start justify-between gap-3">
               <div>
                 <h2 className="text-xl font-black">{editingProjectId ? "Edit Project" : "Tambah Project"}</h2>
-                <p className={`text-sm ${mutedText}`}>Isi tanggal masuk, deadline, status, prioritas, dan note.</p>
+                <p className={`text-sm ${mutedText}`}>Isi tanggal masuk, status, prioritas, note, dan deadline kalau memang ada.</p>
               </div>
               {editingProjectId ? (
                 <button onClick={resetForm} className={`rounded-2xl border ${borderColor} px-3 py-2 text-sm font-bold`}>
@@ -1315,8 +1336,16 @@ export default function Home() {
                   <input type="date" value={masukDate} onChange={(event) => setMasukDate(event.target.value)} className={inputClass} />
                 </div>
                 <div>
-                  <label className={`mb-1 block text-xs font-bold ${mutedText}`}>Deadline</label>
-                  <input type="date" value={deadlineDate} onChange={(event) => setDeadlineDate(event.target.value)} className={inputClass} />
+                  <label className={`mb-1 block text-xs font-bold ${mutedText}`}>Deadline <span className="font-normal">(opsional)</span></label>
+                  <div className="flex gap-2">
+                    <input type="date" value={deadlineDate} onChange={(event) => setDeadlineDate(event.target.value)} className={inputClass} />
+                    {deadlineDate ? (
+                      <button type="button" onClick={() => setDeadlineDate("")} className={`shrink-0 rounded-2xl border ${borderColor} px-3 py-2 text-xs font-black`}>
+                        Kosongkan
+                      </button>
+                    ) : null}
+                  </div>
+                  <p className={`mt-1 text-xs ${mutedText}`}>Boleh dikosongkan kalau project belum punya deadline.</p>
                 </div>
               </div>
 
@@ -1390,7 +1419,7 @@ export default function Home() {
                         <div className="min-w-0">
                           <h3 className="truncate font-black">{project.title}</h3>
                           <p className={`mt-1 truncate text-sm ${mutedText}`}>{project.client || "Tanpa client/divisi"}</p>
-                          <p className={`mt-1 text-xs ${mutedText}`}>Deadline {project.deadlineDate}</p>
+                          <p className={`mt-1 text-xs ${mutedText}`}>Deadline {formatDeadlineDate(project.deadlineDate)}</p>
                         </div>
                         <span className={`shrink-0 rounded-full px-3 py-1 text-xs font-black ${getDeadlineClass(project)}`}>
                           {getDeadlineLabel(project)}
@@ -1424,7 +1453,7 @@ export default function Home() {
                     </div>
                     <div className={`rounded-2xl ${softCardBg} p-3`}>
                       <p className={`text-xs font-bold ${mutedText}`}>Deadline</p>
-                      <p className="font-black">{selectedProject.deadlineDate}</p>
+                      <p className="font-black">{formatDeadlineDate(selectedProject.deadlineDate)}</p>
                     </div>
                     <div className={`rounded-2xl ${softCardBg} p-3`}>
                       <p className={`text-xs font-bold ${mutedText}`}>Status</p>
@@ -1882,7 +1911,7 @@ export default function Home() {
                         <div className="min-w-0">
                           <h4 className="truncate font-black">{project.title}</h4>
                           <p className={`mt-1 text-sm ${mutedText}`}>{project.client || "Tanpa client/divisi"}</p>
-                          <p className={`mt-1 text-xs ${mutedText}`}>Masuk {project.masukDate} · Deadline {project.deadlineDate}</p>
+                          <p className={`mt-1 text-xs ${mutedText}`}>Masuk {project.masukDate} · Deadline {formatDeadlineDate(project.deadlineDate)}</p>
                           <div className="mt-2 flex flex-wrap gap-2 text-xs font-bold">
                             <span className={`rounded-full ${softCardBg} px-3 py-1`}>{project.pendingTasks}/{project.totalTasks} tugas pending</span>
                             <span className={`rounded-full ${softCardBg} px-3 py-1`}>{project.totalNotes} note</span>
