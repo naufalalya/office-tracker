@@ -42,7 +42,17 @@ type ActiveMenu =
   | "tugas"
   | "catatan"
   | "laporan"
-  | "settings";
+  | "settings"
+  | "query";
+
+type WorkSavedQuery = {
+  id: string;
+  userId: string;
+  title: string;
+  queryText: string;
+  createdAtMillis: number;
+  updatedAtMillis: number;
+};
 
 type WorkProject = {
   id: string;
@@ -298,6 +308,19 @@ export default function Home() {
   const [filterPriority, setFilterPriority] = useState<ProjectPriority | "">(
     "",
   );
+
+  const savedQueryFetchGeneration = useRef(0);
+  const [savedQueries, setSavedQueries] = useState<WorkSavedQuery[]>([]);
+  const [savedQueryTitle, setSavedQueryTitle] = useState("");
+  const [savedQueryText, setSavedQueryText] = useState("");
+  const [savedQuerySearch, setSavedQuerySearch] = useState("");
+  const [editingSavedQueryId, setEditingSavedQueryId] = useState("");
+  const [isSavingSavedQuery, setIsSavingSavedQuery] = useState(false);
+  const [isLoadingSavedQueries, setIsLoadingSavedQueries] = useState(false);
+  const [savedQueryError, setSavedQueryError] = useState("");
+  const [savedQueryNotice, setSavedQueryNotice] = useState("");
+  const [viewingSavedQueryId, setViewingSavedQueryId] = useState("");
+  const [busySavedQueryId, setBusySavedQueryId] = useState("");
 
   const username = getUsernameFromEmail(currentUser?.email);
 
@@ -1023,6 +1046,259 @@ export default function Home() {
     if (!currentUser) return;
     fetchProjects();
   }, [currentUser?.uid]);
+
+  const resetSavedQueryForm = () => {
+    setEditingSavedQueryId("");
+    setSavedQueryTitle("");
+    setSavedQueryText("");
+  };
+
+  const getSavedQueryError = (error: unknown, action: string) => {
+    const code = (error as { code?: string })?.code ?? "";
+    if (code.includes("permission-denied"))
+      return "Akses Query belum diizinkan. Tambahkan izin workSavedQueries di Firestore Rules, lalu klik Refresh.";
+    return `Gagal ${action} query. Periksa koneksi lalu coba lagi.`;
+  };
+
+  const fetchSavedQueries = async () => {
+    if (!currentUser) return;
+    const uid = currentUser.uid;
+    const generation = ++savedQueryFetchGeneration.current;
+    setIsLoadingSavedQueries(true);
+    setSavedQueryError("");
+    try {
+      const snapshot = await getDocs(
+        query(collection(db, "workSavedQueries"), where("userId", "==", uid)),
+      );
+      if (
+        activeUserId.current !== uid ||
+        savedQueryFetchGeneration.current !== generation
+      )
+        return;
+      setSavedQueries(
+        snapshot.docs
+          .map((item): WorkSavedQuery => {
+            const data = item.data();
+            const createdAtMillis =
+              data.createdAt instanceof Timestamp
+                ? data.createdAt.toMillis()
+                : 0;
+            const updatedAtMillis =
+              data.updatedAt instanceof Timestamp
+                ? data.updatedAt.toMillis()
+                : createdAtMillis;
+            return {
+              id: item.id,
+              userId: uid,
+              title:
+                typeof data.title === "string" ? data.title : "Tanpa judul",
+              queryText:
+                typeof data.queryText === "string" ? data.queryText : "",
+              createdAtMillis,
+              updatedAtMillis,
+            };
+          })
+          .sort((a, b) => b.updatedAtMillis - a.updatedAtMillis),
+      );
+    } catch (error) {
+      if (
+        activeUserId.current !== uid ||
+        savedQueryFetchGeneration.current !== generation
+      )
+        return;
+      console.error(error);
+      setSavedQueryError(getSavedQueryError(error, "memuat"));
+    } finally {
+      if (
+        activeUserId.current === uid &&
+        savedQueryFetchGeneration.current === generation
+      )
+        setIsLoadingSavedQueries(false);
+    }
+  };
+
+  useEffect(() => {
+    ++savedQueryFetchGeneration.current;
+    setSavedQueries([]);
+    resetSavedQueryForm();
+    setSavedQuerySearch("");
+    setSavedQueryError("");
+    setSavedQueryNotice("");
+    setViewingSavedQueryId("");
+    setBusySavedQueryId("");
+    setIsSavingSavedQuery(false);
+    setIsLoadingSavedQueries(false);
+  }, [currentUser?.uid]);
+
+  useEffect(() => {
+    if (currentUser && activeMenu === "query") void fetchSavedQueries();
+  }, [currentUser?.uid, activeMenu]);
+
+  const saveSavedQuery = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!currentUser || isSavingSavedQuery || busySavedQueryId) return;
+    const uid = currentUser.uid;
+    const cleanTitle = savedQueryTitle.trim();
+    if (!cleanTitle || !savedQueryText.trim()) {
+      setSavedQueryError("Judul dan isi query wajib diisi.");
+      return;
+    }
+    if (cleanTitle.length > 200 || savedQueryText.length > 100000) {
+      setSavedQueryError(
+        "Judul maksimal 200 karakter dan isi query maksimal 100.000 karakter.",
+      );
+      return;
+    }
+    setIsSavingSavedQuery(true);
+    setSavedQueryError("");
+    setSavedQueryNotice("");
+    try {
+      let id = editingSavedQueryId;
+      const previous = savedQueries.find((item) => item.id === id);
+      const payload = {
+        userId: uid,
+        title: cleanTitle,
+        queryText: savedQueryText,
+        updatedAt: serverTimestamp(),
+      };
+      if (id) {
+        if (!previous || previous.userId !== uid)
+          throw new Error("Query tidak ditemukan");
+        await updateDoc(doc(db, "workSavedQueries", id), payload);
+      } else {
+        const created = await addDoc(collection(db, "workSavedQueries"), {
+          ...payload,
+          createdAt: serverTimestamp(),
+        });
+        id = created.id;
+      }
+      if (activeUserId.current !== uid) return;
+      // Preserve whitespace and line breaks exactly as entered.
+      const localRow: WorkSavedQuery = {
+        id,
+        userId: uid,
+        title: cleanTitle,
+        queryText: savedQueryText,
+        createdAtMillis: previous?.createdAtMillis || Date.now(),
+        updatedAtMillis: Date.now(),
+      };
+      setSavedQueries((rows) =>
+        [localRow, ...rows.filter((item) => item.id !== id)].sort(
+          (a, b) => b.updatedAtMillis - a.updatedAtMillis,
+        ),
+      );
+      resetSavedQueryForm();
+      setSavedQuerySearch("");
+      setSavedQueryNotice(
+        previous
+          ? "Perubahan query berhasil disimpan."
+          : "Query berhasil disimpan.",
+      );
+    } catch (error) {
+      if (activeUserId.current === uid) {
+        console.error(error);
+        setSavedQueryError(getSavedQueryError(error, "menyimpan"));
+      }
+    } finally {
+      if (activeUserId.current === uid) setIsSavingSavedQuery(false);
+    }
+  };
+
+  const editSavedQuery = (item: WorkSavedQuery) => {
+    if (
+      isSavingSavedQuery ||
+      busySavedQueryId ||
+      item.userId !== currentUser?.uid
+    )
+      return;
+    setEditingSavedQueryId(item.id);
+    setSavedQueryTitle(item.title);
+    setSavedQueryText(item.queryText);
+    setSavedQueryError("");
+    setSavedQueryNotice("");
+    setViewingSavedQueryId("");
+    window.setTimeout(
+      () =>
+        document
+          .getElementById("saved-query-editor")
+          ?.scrollIntoView({ behavior: "smooth", block: "start" }),
+      0,
+    );
+  };
+
+  const deleteSavedQuery = async (item: WorkSavedQuery) => {
+    if (
+      !currentUser ||
+      item.userId !== currentUser.uid ||
+      isSavingSavedQuery ||
+      busySavedQueryId
+    )
+      return;
+    if (!window.confirm(`Hapus query “${item.title}”?`)) return;
+    const uid = currentUser.uid;
+    setBusySavedQueryId(item.id);
+    setSavedQueryError("");
+    setSavedQueryNotice("");
+    try {
+      await deleteDoc(doc(db, "workSavedQueries", item.id));
+      if (activeUserId.current !== uid) return;
+      setSavedQueries((rows) => rows.filter((row) => row.id !== item.id));
+      if (editingSavedQueryId === item.id) resetSavedQueryForm();
+      if (viewingSavedQueryId === item.id) setViewingSavedQueryId("");
+      setSavedQueryNotice("Query berhasil dihapus.");
+    } catch (error) {
+      if (activeUserId.current === uid) {
+        console.error(error);
+        setSavedQueryError(getSavedQueryError(error, "menghapus"));
+      }
+    } finally {
+      if (activeUserId.current === uid) setBusySavedQueryId("");
+    }
+  };
+
+  const copySavedQuery = async (item: WorkSavedQuery) => {
+    const uid = currentUser?.uid;
+    if (!uid || item.userId !== uid) return;
+    try {
+      await navigator.clipboard.writeText(item.queryText);
+      if (activeUserId.current === uid) {
+        setSavedQueryError("");
+        setSavedQueryNotice(`Isi query “${item.title}” sudah disalin.`);
+      }
+    } catch {
+      if (activeUserId.current === uid) {
+        setSavedQueryNotice("");
+        setSavedQueryError(
+          "Belum bisa menyalin otomatis. Buka Lihat query, lalu pilih teks dan salin secara manual.",
+        );
+      }
+    }
+  };
+
+  const filteredSavedQueries = useMemo(() => {
+    const text = savedQuerySearch.trim().toLowerCase();
+    return savedQueries.filter(
+      (item) =>
+        !text ||
+        `${item.title}\n${item.queryText}`.toLowerCase().includes(text),
+    );
+  }, [savedQueries, savedQuerySearch]);
+  const viewingSavedQuery =
+    savedQueries.find((item) => item.id === viewingSavedQueryId) ?? null;
+
+  useEffect(() => {
+    if (!viewingSavedQueryId) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setViewingSavedQueryId("");
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [viewingSavedQueryId]);
 
   const handleLogin = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -3470,6 +3746,227 @@ export default function Home() {
           </div>
         )}
 
+        {activeMenu === "query" && (
+          <div className="space-y-3">
+            <section className={panelClass}>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-[16px] font-semibold">Query Tersimpan</h2>
+                  <p className={`mt-1 text-[13px] ${mutedText}`}>
+                    Simpan query dengan judul agar mudah ditemukan kembali.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className={secondaryButton}
+                  disabled={
+                    isLoadingSavedQueries ||
+                    isSavingSavedQuery ||
+                    !!busySavedQueryId
+                  }
+                  onClick={() => void fetchSavedQueries()}
+                >
+                  {isLoadingSavedQueries ? "Memuat..." : "Refresh query"}
+                </button>
+              </div>
+              {savedQueryError && (
+                <p
+                  role="alert"
+                  className="mt-3 rounded-xl bg-red-500/10 px-3 py-2 text-[12px] text-red-500"
+                >
+                  {savedQueryError}
+                </p>
+              )}
+              {savedQueryNotice && (
+                <p
+                  role="status"
+                  className={`mt-3 rounded-xl bg-emerald-500/10 px-3 py-2 text-[12px] ${smallAccent}`}
+                >
+                  {savedQueryNotice}
+                </p>
+              )}
+            </section>
+            <div className="grid items-start gap-3 lg:grid-cols-[1.1fr_0.9fr]">
+              <section
+                id="saved-query-editor"
+                className={`${panelClass} scroll-mt-4`}
+              >
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-[14px] font-semibold">
+                    {editingSavedQueryId ? "Edit Query" : "Tambah Query"}
+                  </h3>
+                  {editingSavedQueryId && (
+                    <button
+                      type="button"
+                      className={`text-[12px] font-medium ${smallAccent}`}
+                      disabled={isSavingSavedQuery}
+                      onClick={() => {
+                        resetSavedQueryForm();
+                        setSavedQueryNotice("");
+                        setSavedQueryError("");
+                      }}
+                    >
+                      Batal edit query
+                    </button>
+                  )}
+                </div>
+                <form onSubmit={saveSavedQuery} className="space-y-3">
+                  <label className="block">
+                    <span
+                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
+                    >
+                      Judul query *
+                    </span>
+                    <input
+                      aria-label="Judul query"
+                      className={inputClass}
+                      value={savedQueryTitle}
+                      onChange={(event) =>
+                        setSavedQueryTitle(event.target.value)
+                      }
+                      placeholder="Contoh: Cek selisih jurnal Kasbank"
+                      required
+                      maxLength={200}
+                      disabled={isSavingSavedQuery}
+                    />
+                  </label>
+                  <label className="block">
+                    <span
+                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
+                    >
+                      Isi query *
+                    </span>
+                    <textarea
+                      aria-label="Isi query"
+                      className={`${inputClass} min-h-[260px] resize-y overflow-x-auto font-mono`}
+                      value={savedQueryText}
+                      onChange={(event) =>
+                        setSavedQueryText(event.target.value)
+                      }
+                      placeholder={
+                        "SELECT *\nFROM trans_j\nWHERE no_bukti = '...';"
+                      }
+                      rows={12}
+                      wrap="off"
+                      spellCheck={false}
+                      autoCorrect="off"
+                      autoCapitalize="off"
+                      required
+                      maxLength={100000}
+                      disabled={isSavingSavedQuery}
+                    />
+                  </label>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <span className={`text-[11px] ${mutedText}`}>
+                      {savedQueryText.length.toLocaleString("id-ID")} karakter
+                    </span>
+                    <button
+                      disabled={
+                        isSavingSavedQuery ||
+                        isLoadingSavedQueries ||
+                        !!busySavedQueryId
+                      }
+                      className={buttonClass}
+                    >
+                      {isSavingSavedQuery
+                        ? "Menyimpan..."
+                        : editingSavedQueryId
+                          ? "Simpan perubahan query"
+                          : "Simpan query"}
+                    </button>
+                  </div>
+                </form>
+              </section>
+              <section className={panelClass}>
+                <div className="mb-3">
+                  <h3 className="text-[14px] font-semibold">Daftar Query</h3>
+                  <p className={`mt-1 text-[12px] ${mutedText}`}>
+                    {filteredSavedQueries.length} query tampil dari{" "}
+                    {savedQueries.length} tersimpan
+                  </p>
+                </div>
+                <input
+                  aria-label="Cari query"
+                  className={inputClass}
+                  value={savedQuerySearch}
+                  onChange={(event) => setSavedQuerySearch(event.target.value)}
+                  placeholder="Cari judul atau isi query"
+                />
+                {isLoadingSavedQueries ? (
+                  <p className={`mt-4 text-[12px] ${mutedText}`}>
+                    Memuat query...
+                  </p>
+                ) : filteredSavedQueries.length === 0 ? (
+                  <p className={`mt-4 text-[12px] ${mutedText}`}>
+                    {savedQuerySearch
+                      ? "Tidak ada query yang cocok dengan pencarian."
+                      : savedQueryError
+                        ? "Klik Refresh setelah akses atau koneksi diperbaiki."
+                        : "Belum ada query. Tambahkan judul dan isi query di form."}
+                  </p>
+                ) : (
+                  <div className="mt-3 space-y-3 lg:max-h-[620px] lg:overflow-y-auto lg:pr-1">
+                    {filteredSavedQueries.map((item) => (
+                      <article
+                        key={item.id}
+                        className={`min-w-0 rounded-2xl border ${borderColor} ${softCardBg} p-3`}
+                      >
+                        <h4 className="break-words text-[13px] font-semibold">
+                          {item.title}
+                        </h4>
+                        <p className={`mt-1 text-[11px] ${mutedText}`}>
+                          {item.updatedAtMillis
+                            ? `Diperbarui ${new Date(item.updatedAtMillis).toLocaleString("id-ID", { dateStyle: "medium", timeStyle: "short" })}`
+                            : "Tanggal belum tersedia"}
+                        </p>
+                        <pre
+                          className={`mt-3 max-h-16 overflow-hidden whitespace-pre-wrap break-all font-mono text-[11px] leading-4 ${mutedText}`}
+                        >
+                          {item.queryText.split("\n").slice(0, 2).join("\n")}
+                        </pre>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            className={secondaryButton}
+                            onClick={() => setViewingSavedQueryId(item.id)}
+                          >
+                            Lihat query
+                          </button>
+                          <button
+                            type="button"
+                            className={secondaryButton}
+                            onClick={() => void copySavedQuery(item)}
+                          >
+                            Salin query
+                          </button>
+                          <button
+                            type="button"
+                            className={secondaryButton}
+                            disabled={isSavingSavedQuery || !!busySavedQueryId}
+                            onClick={() => editSavedQuery(item)}
+                          >
+                            Edit query
+                          </button>
+                          <button
+                            type="button"
+                            className="rounded-xl bg-red-100 px-3 py-2 text-[12px] font-medium text-red-700 disabled:opacity-60"
+                            disabled={isSavingSavedQuery || !!busySavedQueryId}
+                            onClick={() => void deleteSavedQuery(item)}
+                          >
+                            {busySavedQueryId === item.id
+                              ? "Menghapus..."
+                              : "Hapus query"}
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </section>
+            </div>
+          </div>
+        )}
+
         {activeMenu === "settings" && (
           <section className={panelClass}>
             <h2 className="text-[16px] font-semibold">Settings</h2>
@@ -3588,6 +4085,85 @@ export default function Home() {
         </div>
       )}
 
+      {viewingSavedQuery && (
+        <div
+          className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 p-3 backdrop-blur-sm"
+          onClick={() => setViewingSavedQueryId("")}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="query-view-title"
+            onClick={(event) => event.stopPropagation()}
+            className={`flex max-h-[85dvh] w-full max-w-4xl flex-col ${panelClass} shadow-2xl`}
+          >
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className={`mb-1 text-[11px] ${mutedText}`}>
+                  Query tersimpan
+                </p>
+                <h2
+                  id="query-view-title"
+                  className="break-words text-[16px] font-semibold"
+                >
+                  {viewingSavedQuery.title}
+                </h2>
+              </div>
+              <button
+                type="button"
+                autoFocus
+                aria-label="Tutup lihat query"
+                className={secondaryButton}
+                onClick={() => setViewingSavedQueryId("")}
+              >
+                ×
+              </button>
+            </div>
+            <pre
+              tabIndex={0}
+              aria-label="Isi query tersimpan"
+              className={`min-h-0 flex-1 select-text overflow-auto rounded-xl border ${borderColor} ${isDarkMode ? "bg-[#111214]" : "bg-neutral-50"} p-3 font-mono text-[12px] leading-5`}
+            >
+              <code>{viewingSavedQuery.queryText}</code>
+            </pre>
+            {savedQueryNotice && (
+              <p role="status" className={`mt-3 text-[12px] ${smallAccent}`}>
+                {savedQueryNotice}
+              </p>
+            )}
+            {savedQueryError && (
+              <p role="alert" className="mt-3 text-[12px] text-red-500">
+                {savedQueryError}
+              </p>
+            )}
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                className={buttonClass}
+                onClick={() => void copySavedQuery(viewingSavedQuery)}
+              >
+                Salin query
+              </button>
+              <button
+                type="button"
+                className={secondaryButton}
+                disabled={isSavingSavedQuery || !!busySavedQueryId}
+                onClick={() => editSavedQuery(viewingSavedQuery)}
+              >
+                Edit query
+              </button>
+              <button
+                type="button"
+                className={secondaryButton}
+                onClick={() => setViewingSavedQueryId("")}
+              >
+                Tutup
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
       {isNavigationMenuOpen && (
         <div
           className="fixed inset-0 z-[70] bg-black/50 p-3 backdrop-blur-sm"
@@ -3616,6 +4192,7 @@ export default function Home() {
                 ["project", "🗂️", "Kasus"],
                 ["tugas", "☑️", "Tugas"],
                 ["catatan", "📝", "Catatan"],
+                ["query", "SQL", "Query"],
                 ["riwayat", "🧾", "Riwayat"],
                 ["laporan", "📊", "Laporan"],
                 ["settings", "⚙️", "Settings"],
@@ -3669,7 +4246,7 @@ export default function Home() {
             type="button"
             aria-expanded={isNavigationMenuOpen}
             onClick={() => setIsNavigationMenuOpen((value) => !value)}
-            className={`min-h-[48px] rounded-xl px-1 py-1.5 text-[11px] font-medium ${isNavigationMenuOpen || ["tambah", "catatan", "riwayat", "laporan", "settings"].includes(activeMenu) ? "bg-[#A7F3D0] text-[#111214]" : mutedText}`}
+            className={`min-h-[48px] rounded-xl px-1 py-1.5 text-[11px] font-medium ${isNavigationMenuOpen || ["tambah", "catatan", "query", "riwayat", "laporan", "settings"].includes(activeMenu) ? "bg-[#A7F3D0] text-[#111214]" : mutedText}`}
           >
             <div aria-hidden="true" className="mb-0.5 text-[16px]">
               ☰
