@@ -48,6 +48,7 @@ type ActiveMenu =
 type WorkSavedQuery = {
   id: string;
   userId: string;
+  client: string;
   title: string;
   queryText: string;
   createdAtMillis: number;
@@ -311,6 +312,8 @@ export default function Home() {
 
   const savedQueryFetchGeneration = useRef(0);
   const [savedQueries, setSavedQueries] = useState<WorkSavedQuery[]>([]);
+  const [savedQueryClient, setSavedQueryClient] = useState("");
+  const [savedQueryFilterClient, setSavedQueryFilterClient] = useState("");
   const [savedQueryTitle, setSavedQueryTitle] = useState("");
   const [savedQueryText, setSavedQueryText] = useState("");
   const [savedQuerySearch, setSavedQuerySearch] = useState("");
@@ -1047,7 +1050,13 @@ export default function Home() {
     fetchProjects();
   }, [currentUser?.uid]);
 
+  const savedQueryClientOptions = uniqueLabels([
+    ...clientOptions,
+    ...savedQueries.map((item) => item.client),
+  ]);
+
   const resetSavedQueryForm = () => {
+    setSavedQueryClient("");
     setEditingSavedQueryId("");
     setSavedQueryTitle("");
     setSavedQueryText("");
@@ -1090,6 +1099,10 @@ export default function Home() {
             return {
               id: item.id,
               userId: uid,
+              client:
+                typeof data.client === "string"
+                  ? normalizeClient(data.client)
+                  : "",
               title:
                 typeof data.title === "string" ? data.title : "Tanpa judul",
               queryText:
@@ -1120,6 +1133,7 @@ export default function Home() {
   useEffect(() => {
     ++savedQueryFetchGeneration.current;
     setSavedQueries([]);
+    setSavedQueryFilterClient("");
     resetSavedQueryForm();
     setSavedQuerySearch("");
     setSavedQueryError("");
@@ -1155,8 +1169,14 @@ export default function Home() {
     try {
       let id = editingSavedQueryId;
       const previous = savedQueries.find((item) => item.id === id);
+      const selectedClient = normalizeClient(savedQueryClient);
+      const clientName =
+        savedQueryClientOptions.find(
+          (item) => item.toLowerCase() === selectedClient.toLowerCase(),
+        ) ?? selectedClient;
       const payload = {
         userId: uid,
+        client: clientName,
         title: cleanTitle,
         queryText: savedQueryText,
         updatedAt: serverTimestamp(),
@@ -1177,6 +1197,7 @@ export default function Home() {
       const localRow: WorkSavedQuery = {
         id,
         userId: uid,
+        client: clientName,
         title: cleanTitle,
         queryText: savedQueryText,
         createdAtMillis: previous?.createdAtMillis || Date.now(),
@@ -1188,6 +1209,7 @@ export default function Home() {
         ),
       );
       resetSavedQueryForm();
+      setSavedQueryFilterClient("");
       setSavedQuerySearch("");
       setSavedQueryNotice(
         previous
@@ -1212,6 +1234,7 @@ export default function Home() {
     )
       return;
     setEditingSavedQueryId(item.id);
+    setSavedQueryClient(item.client);
     setSavedQueryTitle(item.title);
     setSavedQueryText(item.queryText);
     setSavedQueryError("");
@@ -1277,12 +1300,20 @@ export default function Home() {
 
   const filteredSavedQueries = useMemo(() => {
     const text = savedQuerySearch.trim().toLowerCase();
-    return savedQueries.filter(
-      (item) =>
+    return savedQueries.filter((item) => {
+      const matchesClient =
+        !savedQueryFilterClient ||
+        (savedQueryFilterClient === "__without_client__"
+          ? !item.client
+          : item.client.toLowerCase() === savedQueryFilterClient.toLowerCase());
+      const matchesSearch =
         !text ||
-        `${item.title}\n${item.queryText}`.toLowerCase().includes(text),
-    );
-  }, [savedQueries, savedQuerySearch]);
+        `${item.title}\n${item.client}\n${item.queryText}`
+          .toLowerCase()
+          .includes(text);
+      return matchesClient && matchesSearch;
+    });
+  }, [savedQueries, savedQuerySearch, savedQueryFilterClient]);
   const viewingSavedQuery =
     savedQueries.find((item) => item.id === viewingSavedQueryId) ?? null;
 
@@ -3815,6 +3846,30 @@ export default function Home() {
                     <span
                       className={`mb-1 block text-[12px] font-medium ${mutedText}`}
                     >
+                      Client <span className="font-normal">(opsional)</span>
+                    </span>
+                    <input
+                      aria-label="Client query"
+                      list="saved-query-client-options"
+                      className={inputClass}
+                      value={savedQueryClient}
+                      onChange={(event) =>
+                        setSavedQueryClient(event.target.value)
+                      }
+                      placeholder="Pilih / ketik nama client"
+                      maxLength={100}
+                      disabled={isSavingSavedQuery}
+                    />
+                    <datalist id="saved-query-client-options">
+                      {savedQueryClientOptions.map((item) => (
+                        <option key={item} value={item} />
+                      ))}
+                    </datalist>
+                  </label>
+                  <label className="block">
+                    <span
+                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
+                    >
                       Judul query *
                     </span>
                     <input
@@ -3885,12 +3940,37 @@ export default function Home() {
                     {savedQueries.length} tersimpan
                   </p>
                 </div>
+                <label className="mb-2 block">
+                  <span
+                    className={`mb-1 block text-[12px] font-medium ${mutedText}`}
+                  >
+                    Filter client
+                  </span>
+                  <select
+                    aria-label="Filter client query"
+                    className={inputClass}
+                    value={savedQueryFilterClient}
+                    onChange={(event) =>
+                      setSavedQueryFilterClient(event.target.value)
+                    }
+                  >
+                    <option value="">Semua client</option>
+                    <option value="__without_client__">
+                      Umum / tanpa client
+                    </option>
+                    {savedQueryClientOptions.map((item) => (
+                      <option key={item} value={item}>
+                        {item}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <input
                   aria-label="Cari query"
                   className={inputClass}
                   value={savedQuerySearch}
                   onChange={(event) => setSavedQuerySearch(event.target.value)}
-                  placeholder="Cari judul atau isi query"
+                  placeholder="Cari judul, client, atau isi query"
                 />
                 {isLoadingSavedQueries ? (
                   <p className={`mt-4 text-[12px] ${mutedText}`}>
@@ -3898,8 +3978,8 @@ export default function Home() {
                   </p>
                 ) : filteredSavedQueries.length === 0 ? (
                   <p className={`mt-4 text-[12px] ${mutedText}`}>
-                    {savedQuerySearch
-                      ? "Tidak ada query yang cocok dengan pencarian."
+                    {savedQuerySearch || savedQueryFilterClient
+                      ? "Tidak ada query yang cocok dengan pencarian atau filter."
                       : savedQueryError
                         ? "Klik Refresh setelah akses atau koneksi diperbaiki."
                         : "Belum ada query. Tambahkan judul dan isi query di form."}
@@ -3914,6 +3994,11 @@ export default function Home() {
                         <h4 className="break-words text-[13px] font-semibold">
                           {item.title}
                         </h4>
+                        <p
+                          className={`mt-1 break-words text-[11px] font-semibold ${smallAccent}`}
+                        >
+                          {item.client || "Umum / tanpa client"}
+                        </p>
                         <p className={`mt-1 text-[11px] ${mutedText}`}>
                           {item.updatedAtMillis
                             ? `Diperbarui ${new Date(item.updatedAtMillis).toLocaleString("id-ID", { dateStyle: "medium", timeStyle: "short" })}`
@@ -4108,6 +4193,9 @@ export default function Home() {
                 >
                   {viewingSavedQuery.title}
                 </h2>
+                <p className={`mt-1 break-words text-[12px] ${smallAccent}`}>
+                  {viewingSavedQuery.client || "Umum / tanpa client"}
+                </p>
               </div>
               <button
                 type="button"
