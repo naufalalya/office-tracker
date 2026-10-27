@@ -16,15 +16,24 @@ import {
   getDocs,
   query,
   serverTimestamp,
+  setDoc,
   Timestamp,
   updateDoc,
   where,
+  writeBatch,
 } from "firebase/firestore";
+import {
+  getStorage,
+  ref as storageRef,
+  uploadBytesResumable,
+  getDownloadURL,
+  deleteObject,
+} from "firebase/storage";
 import { auth, db } from "../lib/firebase";
 
 type ProjectStatus =
   "Belum Mulai" | "Proses" | "Menunggu" | "Testing" | "Hold" | "Selesai";
-type CaseKind = "Bug" | "Revisi" | "Fitur" | "Support";
+type CaseKind = "Bug" | "Revisi" | "Fitur" | "Support" | "Maintenance";
 type CaseActivity = {
   id: string;
   title: string;
@@ -34,6 +43,8 @@ type CaseActivity = {
 };
 type ProjectPriority = "Rendah" | "Normal" | "Penting" | "Urgent";
 type ActiveMenu =
+  | "clientAdd"
+  | "projects"
   | "client"
   | "dashboard"
   | "tambah"
@@ -55,7 +66,13 @@ type WorkSavedQuery = {
   updatedAtMillis: number;
 };
 
+type FormGroup = "Master" | "Transaksi" | "Report" | "Settings";
+const formGroups: FormGroup[] = ["Master", "Transaksi", "Report", "Settings"];
+type IssueDraft = { id: string; title: string; module: string; requesterPic: string; bladeForm: string; caseKind: CaseKind; deadlineDate: string; priority: ProjectPriority };
+const newIssueDraft = (): IssueDraft => ({ id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, title: "", module: "", requesterPic: "", bladeForm: "", caseKind: "Bug", deadlineDate: "", priority: "Normal" });
+
 type WorkProject = {
+  formGroup?: FormGroup;
   id: string;
   userId: string;
   title: string;
@@ -78,6 +95,7 @@ type WorkProject = {
 };
 
 type ProjectNote = {
+  attachments: NoteAttachment[];
   id: string;
   projectId: string;
   noteDate: string;
@@ -87,6 +105,7 @@ type ProjectNote = {
 };
 
 type WorkTask = {
+  attachments: NoteAttachment[];
   id: string;
   userId: string;
   projectId: string;
@@ -124,7 +143,7 @@ const defaultClients = [
   "LISNA",
   "Bhakti Kencana",
 ];
-const caseKinds: CaseKind[] = ["Bug", "Revisi", "Fitur", "Support"];
+const caseKinds: CaseKind[] = ["Bug", "Revisi", "Fitur", "Maintenance", "Support"];
 const UNASSIGNED_CLIENT = "(Belum dikelompokkan)";
 const UNASSIGNED_MODULE = "(Tanpa modul)";
 const cleanLabel = (value: string) => value.trim().replace(/\s+/g, " ");
@@ -244,7 +263,425 @@ const getDeadlineClass = (project: WorkProject) => {
   return "bg-blue-100 text-blue-700";
 };
 
+type NoteAttachment = {
+  name: string;
+  url: string;
+  path: string;
+  contentType: string;
+  size: number;
+};
+type PendingNoteImage = { id: string; file: File; url: string; name: string };
+type ImagePreview = { name: string; url: string };
+const MAX_NOTE_IMAGES = 5;
+const MAX_NOTE_IMAGE_SIZE = 5 * 1024 * 1024;
+const NOTE_IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+const readNoteAttachments = (value: unknown): NoteAttachment[] => {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(
+      (item) =>
+        item &&
+        typeof item.url === "string" &&
+        item.url.startsWith("https://") &&
+        typeof item.path === "string" &&
+        typeof item.name === "string",
+    )
+    .map((item) => ({
+      name: item.name,
+      url: item.url,
+      path: item.path,
+      contentType:
+        typeof item.contentType === "string" ? item.contentType : "image/png",
+      size: typeof item.size === "number" ? item.size : 0,
+    }));
+};
+
+function useNoteImageDraft() {
+  const [images, setImages] = useState<PendingNoteImage[]>([]);
+  const [error, setError] = useState("");
+  const currentImages = useRef<PendingNoteImage[]>([]);
+  const replaceImages = (next: PendingNoteImage[]) => {
+    currentImages.current
+      .filter((item) => !next.some((other) => other.id === item.id))
+      .forEach((item) => URL.revokeObjectURL(item.url));
+    currentImages.current = next;
+    setImages(next);
+  };
+  const addFiles = (files: File[]) => {
+    if (!files.length) return;
+    if (currentImages.current.length + files.length > MAX_NOTE_IMAGES) {
+      setError(
+        "Maksimal 5 gambar per catatan. Hapus salah satu gambar jika ingin menggantinya.",
+      );
+      return;
+    }
+    const invalid = files.find(
+      (file) =>
+        !NOTE_IMAGE_TYPES.includes(file.type) ||
+        file.size === 0 ||
+        file.size > MAX_NOTE_IMAGE_SIZE,
+    );
+    if (invalid) {
+      setError(
+        `“${invalid.name}” tidak dapat ditambahkan. Gunakan PNG, JPG, WEBP, atau GIF, maksimal 5 MB per gambar.`,
+      );
+      return;
+    }
+    const next = files.map((file) => ({
+      id:
+        globalThis.crypto?.randomUUID?.() ??
+        `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      file,
+      name: file.name,
+      url: URL.createObjectURL(file),
+    }));
+    replaceImages([...currentImages.current, ...next]);
+    setError("");
+  };
+  const remove = (id: string) => {
+    replaceImages(currentImages.current.filter((item) => item.id !== id));
+    setError("");
+  };
+  const clear = () => {
+    replaceImages([]);
+    setError("");
+  };
+  const onPaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(event.clipboardData.files).filter((file) =>
+      file.type.startsWith("image/"),
+    );
+    if (files.length) {
+      event.preventDefault();
+      addFiles(files);
+    }
+  };
+  useEffect(
+    () => () => {
+      currentImages.current.forEach((item) => URL.revokeObjectURL(item.url));
+    },
+    [],
+  );
+  return { images, error, setError, addFiles, remove, clear, onPaste };
+}
+
+function NoteImagePicker({
+  draft,
+  label,
+  disabled,
+  progress,
+  onCancel,
+  onOpen,
+  dark,
+}: {
+  draft: ReturnType<typeof useNoteImageDraft>;
+  label: string;
+  disabled: boolean;
+  progress: number | null;
+  onCancel: () => void;
+  onOpen: (images: ImagePreview[], index: number) => void;
+  dark: boolean;
+}) {
+  const input = useRef<HTMLInputElement>(null);
+  return (
+    <div
+      className={`mt-3 rounded-xl border ${dark ? "border-[#3A3F45]" : "border-neutral-200"} p-3`}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span
+          className={`text-[12px] font-medium ${dark ? "text-[#B8BDC7]" : "text-neutral-500"}`}
+        >
+          Gambar revisi <span className="font-normal">(opsional)</span>
+        </span>
+        <button
+          type="button"
+          disabled={disabled || draft.images.length >= MAX_NOTE_IMAGES}
+          onClick={() => input.current?.click()}
+          className={`rounded-lg border ${dark ? "border-[#3A3F45] text-[#A7F3D0]" : "border-neutral-200 text-emerald-700"} px-3 py-2 text-[12px] font-medium disabled:opacity-50`}
+        >
+          + Tambah gambar
+        </button>
+      </div>
+      <input
+        ref={input}
+        type="file"
+        multiple
+        accept={NOTE_IMAGE_TYPES.join(",")}
+        aria-label={label}
+        className="sr-only"
+        disabled={disabled}
+        onChange={(event) => {
+          draft.addFiles(Array.from(event.target.files ?? []));
+          event.target.value = "";
+        }}
+      />
+      <p
+        className={`mt-2 text-[11px] ${dark ? "text-[#B8BDC7]" : "text-neutral-500"}`}
+      >
+        Maksimal 5 gambar, 5 MB per gambar. Screenshot juga bisa ditempel ke
+        kolom pekerjaan dengan Ctrl/Cmd + V.
+      </p>
+      {draft.images.length > 0 && (
+        <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
+          {draft.images.map((item, index) => (
+            <div key={item.id} className="min-w-0">
+              <button
+                type="button"
+                aria-label={`Perbesar pilihan gambar ${index + 1}`}
+                onClick={() => onOpen(draft.images, index)}
+                className={`block w-full overflow-hidden rounded-lg border ${dark ? "border-[#3A3F45] bg-[#111214]" : "border-neutral-200 bg-white"}`}
+              >
+                <img
+                  src={item.url}
+                  alt={item.name}
+                  className="h-24 w-full object-contain"
+                />
+              </button>
+              <div className="mt-1 flex items-center gap-1">
+                <span
+                  className="min-w-0 flex-1 truncate text-[10px]"
+                  title={item.name}
+                >
+                  {item.name}
+                </span>
+                <button
+                  type="button"
+                  aria-label={`Hapus pilihan gambar ${index + 1}`}
+                  disabled={disabled}
+                  onClick={() => draft.remove(item.id)}
+                  className="shrink-0 px-1 py-1 text-[11px] text-red-500 disabled:opacity-50"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {progress !== null && (
+        <div className="mt-3">
+          <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+            <p role="status" className="text-[11px]">
+              {progress < 100
+                ? `Mengunggah gambar… ${progress}%`
+                : "Menyimpan tugas…"}
+            </p>
+            {progress < 100 && (
+              <button
+                type="button"
+                className="text-[11px] text-red-500"
+                onClick={onCancel}
+              >
+                Batalkan upload
+              </button>
+            )}
+          </div>
+          <div
+            className={`h-1.5 overflow-hidden rounded-full ${dark ? "bg-[#111214]" : "bg-neutral-200"}`}
+          >
+            <div
+              className="h-full rounded-full bg-emerald-400 transition-all"
+              style={{ width: `${progress}%` }}
+            />
+          </div>
+        </div>
+      )}
+      {draft.error && (
+        <p role="alert" className="mt-2 break-words text-[12px] text-red-500">
+          {draft.error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function NoteImageGallery({
+  images,
+  onOpen,
+}: {
+  images: NoteAttachment[];
+  onOpen: (images: ImagePreview[], index: number) => void;
+}) {
+  if (!images.length) return null;
+  return (
+    <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
+      {images.map((item, index) => (
+        <button
+          type="button"
+          key={item.path || `${item.url}-${index}`}
+          aria-label={`Lihat gambar revisi ${index + 1}: ${item.name}`}
+          onClick={() => onOpen(images, index)}
+          className="min-w-0 overflow-hidden rounded-xl border border-neutral-500/20 bg-neutral-500/5 text-left"
+        >
+          <img
+            src={item.url}
+            alt={item.name}
+            loading="lazy"
+            className="h-28 w-full object-contain"
+          />
+          <span
+            className="block truncate px-2 py-1.5 text-[10px]"
+            title={item.name}
+          >
+            {item.name}
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+async function removeNoteImageObjects(paths: string[]) {
+  if (!paths.length) return;
+  const storage = getStorage(auth.app);
+  const results = await Promise.allSettled(
+    paths.map(async (path) => {
+      try {
+        await deleteObject(storageRef(storage, path));
+      } catch (error) {
+        if ((error as { code?: string }).code !== "storage/object-not-found")
+          throw error;
+      }
+    }),
+  );
+  const failure = results.find((result) => result.status === "rejected");
+  if (failure?.status === "rejected") throw failure.reason;
+}
+
+async function uploadNoteAttachments({
+  uid,
+  projectId,
+  noteId,
+  images,
+  signal,
+  onProgress,
+}: {
+  uid: string;
+  projectId: string;
+  noteId: string;
+  images: PendingNoteImage[];
+  signal: AbortSignal;
+  onProgress: (value: number) => void;
+}): Promise<NoteAttachment[]> {
+  if (!images.length) return [];
+  if (!auth.app.options.storageBucket)
+    throw new Error(
+      "Isi NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET di .env.local agar upload gambar dapat digunakan.",
+    );
+  const storage = getStorage(auth.app);
+  const result: NoteAttachment[] = [];
+  const attemptedPaths: string[] = [];
+  try {
+    for (let index = 0; index < images.length; index++) {
+      if (signal.aborted)
+        throw Object.assign(new Error("Upload dibatalkan."), {
+          code: "storage/canceled",
+        });
+      const item = images[index];
+      const extension = (
+        {
+          "image/png": "png",
+          "image/jpeg": "jpg",
+          "image/webp": "webp",
+          "image/gif": "gif",
+        } as Record<string, string>
+      )[item.file.type];
+      const path = `workNoteImages/${uid}/${projectId}/${noteId}/${item.id}.${extension}`;
+      attemptedPaths.push(path);
+      const task = uploadBytesResumable(storageRef(storage, path), item.file, {
+        contentType: item.file.type,
+      });
+      const cancel = () => task.cancel();
+      signal.addEventListener("abort", cancel, { once: true });
+      const unsubscribe = task.on("state_changed", (snapshot) =>
+        onProgress(
+          Math.min(
+            99,
+            Math.floor(
+              ((index +
+                snapshot.bytesTransferred / Math.max(1, snapshot.totalBytes)) /
+                images.length) *
+                100,
+            ),
+          ),
+        ),
+      );
+      try {
+        await task;
+      } finally {
+        unsubscribe();
+        signal.removeEventListener("abort", cancel);
+      }
+      if (signal.aborted)
+        throw Object.assign(new Error("Upload dibatalkan."), {
+          code: "storage/canceled",
+        });
+      const url = await getDownloadURL(task.snapshot.ref);
+      result.push({
+        name: item.name,
+        url,
+        path,
+        contentType: item.file.type,
+        size: item.file.size,
+      });
+    }
+    onProgress(100);
+    return result;
+  } catch (error) {
+    try {
+      await removeNoteImageObjects(attemptedPaths);
+    } catch (cleanupError) {
+      console.error("Upload cleanup failed", cleanupError);
+    }
+    throw error;
+  }
+}
+
+const getNoteSaveError = (error: unknown) => {
+  const code = (error as { code?: string })?.code ?? "";
+  if (code === "storage/canceled")
+    return "Upload dibatalkan. Catatan dan pilihan gambar masih tersedia untuk dicoba lagi.";
+  if (
+    [
+      "storage/unauthorized",
+      "storage/bucket-not-found",
+      "storage/project-not-found",
+      "storage/unknown",
+      "storage/quota-exceeded",
+    ].includes(code)
+  )
+    return "Gambar belum dapat diunggah. Periksa Firebase Storage, paket Blaze, nama bucket, dan Storage Rules. Catatan serta pilihan gambar tetap tersedia.";
+  if (
+    error instanceof Error &&
+    error.message.includes("NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET")
+  )
+    return error.message;
+  return "Catatan belum berhasil disimpan. Periksa koneksi dan izin Firebase, lalu coba lagi. Teks serta pilihan gambar tetap tersedia.";
+};
+
 export default function Home() {
+  const noteImageDraft = useNoteImageDraft();
+  const catatanImageDraft = useNoteImageDraft();
+  const taskImageDraft = useNoteImageDraft();
+  const taskUploadController = useRef<AbortController | null>(null);
+  const [taskUploadProgress, setTaskUploadProgress] = useState<number | null>(
+    null,
+  );
+  const noteUploadControllers = useRef(new Set<AbortController>());
+  const noteUploadController = useRef<AbortController | null>(null);
+  const catatanUploadController = useRef<AbortController | null>(null);
+  const [, setNoteUploadProgress] = useState<number | null>(null);
+  const [, setCatatanUploadProgress] = useState<number | null>(null);
+  const [imageViewer, setImageViewer] = useState<{
+    images: ImagePreview[];
+    index: number;
+  } | null>(null);
+  const [imageZoom, setImageZoom] = useState(1);
+  const imageViewerClose = useRef<HTMLButtonElement>(null);
+  const openNoteImages = (images: ImagePreview[], index: number) => {
+    setImageZoom(1);
+    setImageViewer({ images, index });
+  };
   const activeUserId = useRef<string | null>(null);
   const fetchGeneration = useRef(0);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -253,6 +690,19 @@ export default function Home() {
   const [loginPassword, setLoginPassword] = useState("");
   const [isLoggingIn, setIsLoggingIn] = useState(false);
 
+  const [masterClients, setMasterClients] = useState<string[]>([]);
+  const [newClientName, setNewClientName] = useState("");
+  const [clientError, setClientError] = useState("");
+  const [savingClient, setSavingClient] = useState(false);
+  const [transactionClient, setTransactionClient] = useState("");
+  const [formGroup, setFormGroup] = useState<FormGroup>("Transaksi");
+  const [clientPickerOpen, setClientPickerOpen] = useState(false);
+  const [clientPickerSearch, setClientPickerSearch] = useState("");
+  const [issueRows, setIssueRows] = useState<IssueDraft[]>([newIssueDraft()]);
+  const [gridError, setGridError] = useState("");
+  const [gridNotice, setGridNotice] = useState("");
+  const [savingGrid, setSavingGrid] = useState(false);
+  const [gridDate, setGridDate] = useState(getTodayInputDate());
   const [activeMenu, setActiveMenu] = useState<ActiveMenu>("dashboard");
   const [isNavigationMenuOpen, setIsNavigationMenuOpen] = useState(false);
   const [isDarkMode, setIsDarkMode] = useState(true);
@@ -346,6 +796,7 @@ export default function Home() {
     projects.find((item) => item.id === completionProjectId) ?? null;
   const clientOptions = uniqueLabels([
     ...defaultClients,
+    ...masterClients,
     ...projects.map((item) => item.client),
   ]);
   const moduleOptions = uniqueLabels(
@@ -452,6 +903,7 @@ export default function Home() {
   const activityRows = useMemo(() => {
     const projectActivities = projects.flatMap((project) => {
       const base = {
+        attachments: [] as NoteAttachment[],
         projectId: project.id,
         projectTitle: project.title,
         client: project.client,
@@ -494,6 +946,7 @@ export default function Home() {
       const project = projects.find((item) => item.id === note.projectId);
 
       return {
+        attachments: note.attachments,
         id: `note-${note.id}`,
         type: "Note Progress",
         title: "Note progress ditambahkan",
@@ -516,6 +969,7 @@ export default function Home() {
       const project = projects.find((item) => item.id === task.projectId);
 
       return {
+        attachments: task.attachments,
         id: `task-${task.id}`,
         type: task.isDone ? "Tugas Selesai" : "Tugas Dibuat",
         title: task.isDone ? "Tugas ditandai selesai" : "Tugas ditambahkan",
@@ -839,6 +1293,71 @@ export default function Home() {
     setProjectNotes("");
   };
 
+  useEffect(() => {
+    setMasterClients([]);
+    setTransactionClient("");
+    setClientPickerOpen(false);
+    setIssueRows([newIssueDraft()]);
+    setGridError(""); setGridNotice(""); setClientError("");
+    if (!currentUser) return;
+    let cancelled = false;
+    getDocs(query(collection(db, "workClients"), where("userId", "==", currentUser.uid)))
+      .then(snapshot => { if (!cancelled) setMasterClients(snapshot.docs.map(item => String(item.data().name || "")).filter(Boolean)); })
+      .catch(() => { if (!cancelled) setClientError("Master client belum dapat dimuat. Pastikan Firestore Rules mengizinkan workClients untuk pemilik userId."); });
+    return () => { cancelled = true; };
+  }, [currentUser]);
+
+  const saveMasterClient = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!currentUser || savingClient) return;
+    const name = normalizeClient(newClientName);
+    if (!name) { setClientError("Nama client wajib diisi."); return; }
+    if (clientOptions.some(item => item.toLowerCase() === name.toLowerCase())) { setClientError("Client sudah ada di daftar."); return; }
+    setSavingClient(true); setClientError("");
+    const owner = currentUser.uid;
+    try {
+      await setDoc(doc(db, "workClients", `${owner}_${encodeURIComponent(name.toLowerCase())}`), { userId: owner, name, createdAt: serverTimestamp() });
+      if (activeUserId.current !== owner) return;
+      setMasterClients(previous => uniqueLabels([...previous, name]));
+      setNewClientName(""); openMenuPage("client");
+    } catch { if (activeUserId.current === owner) setClientError("Gagal menyimpan client. Cek koneksi dan izin workClients di Firestore."); }
+    finally { setSavingClient(false); }
+  };
+
+  const updateIssueRow = (id: string, patch: Partial<IssueDraft>) => {
+    setIssueRows(rows => rows.map(row => row.id === id ? { ...row, ...patch } : row));
+    setGridNotice("");
+  };
+  const saveIssueGrid = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!currentUser || savingGrid) return;
+    setGridError(""); setGridNotice("");
+    if (!transactionClient || !gridDate || gridDate > getTodayInputDate()) { setGridError("Pilih client dan tanggal pengajuan yang valid."); return; }
+    if (!issueRows.length || issueRows.length > 100 || issueRows.some(row => !row.title.trim() || !row.module.trim() || !row.requesterPic.trim())) {
+      setGridError("Isi masalah, modul/topik, dan PIC pada setiap baris. Maksimal 100 baris sekali simpan."); return;
+    }
+    setSavingGrid(true);
+    const owner = currentUser.uid;
+    try {
+      const batch = writeBatch(db);
+      issueRows.forEach(row => {
+        batch.set(doc(collection(db, "workProjects")), {
+          userId: owner, client: transactionClient, formGroup,
+          title: row.title.trim(), module: cleanLabel(row.module), requesterPic: row.requesterPic.trim(),
+          bladeForm: row.bladeForm.trim(), caseKind: row.caseKind, masukDate: gridDate,
+          deadlineDate: row.deadlineDate, priority: row.priority, status: "Belum Mulai",
+          notes: "", waitingReason: "", completedDate: "", activityHistory: [],
+          createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
+        });
+      });
+      await batch.commit();
+      if (activeUserId.current !== owner) return;
+      setIssueRows([newIssueDraft()]); setGridNotice("Semua baris berhasil disimpan. Client dan kelompok form tetap dipilih.");
+      await fetchProjects();
+    } catch { if (activeUserId.current === owner) setGridError("Gagal menyimpan daftar masalah. Baris tetap tersedia untuk dicoba lagi."); }
+    finally { setSavingGrid(false); }
+  };
+
   const openMenuPage = (menuId: ActiveMenu) => {
     setActiveMenu(menuId);
     setIsNavigationMenuOpen(false);
@@ -891,6 +1410,7 @@ export default function Home() {
             id: item.id,
             userId: data.userId ?? "",
             title: data.title ?? "",
+            formGroup: formGroups.includes(data.formGroup) ? data.formGroup : undefined,
             client: normalizeClient(data.client ?? ""),
             module: cleanLabel(data.module ?? ""),
             bladeForm: data.bladeForm ?? "",
@@ -938,6 +1458,7 @@ export default function Home() {
 
           return {
             id: item.id,
+            attachments: readNoteAttachments(data.attachments),
             projectId: data.projectId ?? "",
             noteDate: data.noteDate ?? "",
             note: data.note ?? "",
@@ -955,6 +1476,7 @@ export default function Home() {
           const data = item.data();
 
           return {
+            attachments: readNoteAttachments(data.attachments),
             id: item.id,
             userId: data.userId ?? "",
             projectId: data.projectId ?? "",
@@ -1028,6 +1550,10 @@ export default function Home() {
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (activeUserId.current !== (user?.uid ?? null))
+        noteUploadControllers.current.forEach((controller) =>
+          controller.abort(),
+        );
       activeUserId.current = user?.uid ?? null;
       setCurrentUser(user);
       setIsCheckingAuth(false);
@@ -1045,6 +1571,20 @@ export default function Home() {
     setCatatanProjectId("");
     setSelectedHistoryProjectId("");
     setCompletionProjectId("");
+    noteImageDraft.clear();
+    catatanImageDraft.clear();
+    taskImageDraft.clear();
+    setTaskTitle("");
+    setTaskDate(getTodayInputDate());
+    setIsSavingTask(false);
+    setTaskUploadProgress(null);
+    setImageViewer(null);
+    setNoteText("");
+    setCatatanText("");
+    setIsSavingNote(false);
+    setIsSavingCatatan(false);
+    setNoteUploadProgress(null);
+    setCatatanUploadProgress(null);
     resetForm();
     if (!currentUser) return;
     fetchProjects();
@@ -1331,6 +1871,72 @@ export default function Home() {
     };
   }, [viewingSavedQueryId]);
 
+  useEffect(
+    () => () => {
+      noteUploadControllers.current.forEach((controller) => controller.abort());
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!imageViewer) return;
+    const previousOverflow = document.body.style.overflow;
+    const previousFocus =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    document.body.style.overflow = "hidden";
+    const frame = window.requestAnimationFrame(() =>
+      imageViewerClose.current?.focus(),
+    );
+    const keyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setImageViewer(null);
+      }
+      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        const delta = event.key === "ArrowLeft" ? -1 : 1;
+        setImageViewer((value) =>
+          value
+            ? {
+                ...value,
+                index: Math.max(
+                  0,
+                  Math.min(value.images.length - 1, value.index + delta),
+                ),
+              }
+            : null,
+        );
+        setImageZoom(1);
+      }
+      if (event.key === "Tab") {
+        const dialog = imageViewerClose.current?.closest('[role="dialog"]');
+        const controls = Array.from(
+          dialog?.querySelectorAll<HTMLElement>(
+            "button:not(:disabled), a[href]",
+          ) ?? [],
+        );
+        const first = controls[0],
+          last = controls[controls.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last?.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first?.focus();
+        }
+      }
+    };
+    window.addEventListener("keydown", keyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", keyDown);
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
+  }, [!!imageViewer]);
+
   const handleLogin = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
@@ -1579,19 +2185,11 @@ export default function Home() {
       const relatedTasks = tasks.filter(
         (item) => item.projectId === project.id,
       );
-      await Promise.all(
-        relatedTasks.map((item) =>
-          deleteDoc(doc(db, "workProjectTasks", item.id)),
-        ),
-      );
+      await Promise.all(relatedTasks.map((item) => deleteTaskWithImages(item)));
       const relatedNotes = notes.filter(
         (item) => item.projectId === project.id,
       );
-      await Promise.all(
-        relatedNotes.map((item) =>
-          deleteDoc(doc(db, "workProjectNotes", item.id)),
-        ),
-      );
+      await Promise.all(relatedNotes.map((item) => deleteNoteWithImages(item)));
       await deleteDoc(doc(db, "workProjects", project.id));
 
       if (selectedProjectId === project.id) setSelectedProjectId("");
@@ -1603,101 +2201,172 @@ export default function Home() {
     }
   };
 
-  const saveNote = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-
-    if (!currentUser || !selectedProject) {
-      alert("Pilih kasus aktif dulu ya.");
-      return;
-    }
-
-    if (!noteText.trim()) {
-      alert("Isi note dulu ya.");
-      return;
-    }
-
+  const persistNoteWithImages = async (
+    project: WorkProject,
+    text: string,
+    date: string,
+    draft: ReturnType<typeof useNoteImageDraft>,
+    onProgress: (value: number | null) => void,
+    controllerRef: { current: AbortController | null },
+  ) => {
+    if (!currentUser) throw new Error("Login diperlukan");
+    const uid = currentUser.uid;
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    noteUploadControllers.current.add(controller);
+    const noteRef = doc(collection(db, "workProjectNotes"));
+    let attachments: NoteAttachment[] = [];
+    let committed = false;
     try {
-      setIsSavingNote(true);
-
-      await addDoc(collection(db, "workProjectNotes"), {
-        userId: currentUser.uid,
-        projectId: selectedProject.id,
-        projectTitle: selectedProject.title,
-        noteDate,
-        note: noteText.trim(),
+      if (draft.images.length) onProgress(0);
+      attachments = await uploadNoteAttachments({
+        uid,
+        projectId: project.id,
+        noteId: noteRef.id,
+        images: [...draft.images],
+        signal: controller.signal,
+        onProgress: (value) => {
+          if (activeUserId.current === uid) onProgress(value);
+        },
+      });
+      if (controller.signal.aborted || activeUserId.current !== uid)
+        throw Object.assign(new Error("Upload dibatalkan."), {
+          code: "storage/canceled",
+        });
+      await setDoc(noteRef, {
+        userId: uid,
+        projectId: project.id,
+        projectTitle: project.title,
+        noteDate: date,
+        note: text.trim(),
+        ...(attachments.length ? { attachments } : {}),
         createdAt: serverTimestamp(),
       });
+      committed = true;
+    } catch (error) {
+      if (!committed && attachments.length) {
+        try {
+          await removeNoteImageObjects(attachments.map((item) => item.path));
+        } catch (cleanupError) {
+          console.error("Note image cleanup failed", cleanupError);
+        }
+      }
+      throw error;
+    } finally {
+      noteUploadControllers.current.delete(controller);
+      if (controllerRef.current === controller) controllerRef.current = null;
+      if (activeUserId.current === uid) onProgress(null);
+    }
+  };
 
+  const deleteNoteWithImages = async (note: ProjectNote) => {
+    if (!currentUser) throw new Error("Login diperlukan");
+    const prefix = `workNoteImages/${currentUser.uid}/${note.projectId}/${note.id}/`;
+    await removeNoteImageObjects(
+      note.attachments
+        .filter((item) => item.path.startsWith(prefix))
+        .map((item) => item.path),
+    );
+    await deleteDoc(doc(db, "workProjectNotes", note.id));
+  };
+
+  const saveNote = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!currentUser || !selectedProject || isSavingNote) return;
+    if (!noteText.trim() && !noteImageDraft.images.length) {
+      noteImageDraft.setError(
+        "Isi catatan atau tambahkan gambar terlebih dahulu.",
+      );
+      return;
+    }
+    const uid = currentUser.uid;
+    try {
+      setIsSavingNote(true);
+      noteImageDraft.setError("");
+      await persistNoteWithImages(
+        selectedProject,
+        noteText,
+        noteDate,
+        noteImageDraft,
+        setNoteUploadProgress,
+        noteUploadController,
+      );
+      if (activeUserId.current !== uid) return;
       setNoteText("");
       setNoteDate(getTodayInputDate());
+      noteImageDraft.clear();
       await fetchProjects();
     } catch (error) {
-      console.error(error);
-      alert("Gagal menyimpan note.");
+      if (activeUserId.current === uid) {
+        console.error(error);
+        noteImageDraft.setError(getNoteSaveError(error));
+      }
     } finally {
-      setIsSavingNote(false);
+      if (activeUserId.current === uid) setIsSavingNote(false);
     }
   };
 
   const deleteNote = async (noteId: string) => {
-    const ok = window.confirm("Hapus note ini?");
-    if (!ok) return;
-
+    const note = notes.find((item) => item.id === noteId);
+    if (!note || !window.confirm("Hapus catatan ini beserta gambar terlampir?"))
+      return;
     try {
-      await deleteDoc(doc(db, "workProjectNotes", noteId));
+      await deleteNoteWithImages(note);
       await fetchProjects();
     } catch (error) {
       console.error(error);
-      alert("Gagal menghapus note.");
+      alert(
+        "Catatan belum selesai dihapus. Periksa koneksi dan izin Firebase, lalu coba lagi.",
+      );
+      await fetchProjects();
     }
   };
 
   const saveCatatan = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-
-    if (!currentUser) {
-      alert("Login dulu ya.");
+    if (!currentUser || isSavingCatatan) return;
+    const target = projects.find((item) => item.id === catatanProjectId);
+    if (!target) {
+      catatanImageDraft.setError("Pilih kasus terlebih dahulu.");
       return;
     }
-
-    const targetProject = projects.find((item) => item.id === catatanProjectId);
-
-    if (!targetProject) {
-      alert("Pilih kasus untuk catatan ini dulu ya.");
+    if (!catatanText.trim() && !catatanImageDraft.images.length) {
+      catatanImageDraft.setError(
+        "Isi catatan atau tambahkan gambar terlebih dahulu.",
+      );
       return;
     }
-
-    if (!catatanText.trim()) {
-      alert("Isi catatan dulu ya.");
-      return;
-    }
-
+    const uid = currentUser.uid;
     try {
       setIsSavingCatatan(true);
-
-      await addDoc(collection(db, "workProjectNotes"), {
-        userId: currentUser.uid,
-        projectId: targetProject.id,
-        projectTitle: targetProject.title,
-        noteDate: catatanDate,
-        note: catatanText.trim(),
-        createdAt: serverTimestamp(),
-      });
-
+      catatanImageDraft.setError("");
+      await persistNoteWithImages(
+        target,
+        catatanText,
+        catatanDate,
+        catatanImageDraft,
+        setCatatanUploadProgress,
+        catatanUploadController,
+      );
+      if (activeUserId.current !== uid) return;
       setCatatanText("");
       setCatatanDate(getTodayInputDate());
+      catatanImageDraft.clear();
       await fetchProjects();
       alert("Catatan berhasil disimpan.");
     } catch (error) {
-      console.error(error);
-      alert("Gagal menyimpan catatan.");
+      if (activeUserId.current === uid) {
+        console.error(error);
+        catatanImageDraft.setError(getNoteSaveError(error));
+      }
     } finally {
-      setIsSavingCatatan(false);
+      if (activeUserId.current === uid) setIsSavingCatatan(false);
     }
   };
 
   const saveTask = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (isSavingTask) return;
 
     if (!currentUser) {
       alert("Login dulu ya.");
@@ -1714,28 +2383,83 @@ export default function Home() {
       return;
     }
 
+    const uid = currentUser.uid;
+    const controller = new AbortController();
+    taskUploadController.current = controller;
+    noteUploadControllers.current.add(controller);
+    const taskRef = doc(collection(db, "workProjectTasks"));
+    let attachments: NoteAttachment[] = [];
+    let committed = false;
     try {
       setIsSavingTask(true);
-
-      await addDoc(collection(db, "workProjectTasks"), {
-        userId: currentUser.uid,
+      taskImageDraft.setError("");
+      if (taskImageDraft.images.length) setTaskUploadProgress(0);
+      attachments = await uploadNoteAttachments({
+        uid,
+        projectId: taskProjectId,
+        noteId: `task-${taskRef.id}`,
+        images: [...taskImageDraft.images],
+        signal: controller.signal,
+        onProgress: (value) => {
+          if (activeUserId.current === uid) setTaskUploadProgress(value);
+        },
+      });
+      if (controller.signal.aborted || activeUserId.current !== uid)
+        throw Object.assign(new Error("Upload dibatalkan."), {
+          code: "storage/canceled",
+        });
+      await setDoc(taskRef, {
+        userId: uid,
         projectId: taskProjectId,
         title: taskTitle.trim(),
         taskDate,
         isDone: false,
+        ...(attachments.length ? { attachments } : {}),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-
+      committed = true;
+      if (activeUserId.current !== uid) return;
       setTaskTitle("");
       setTaskDate(getTodayInputDate());
+      taskImageDraft.clear();
       await fetchProjects();
     } catch (error) {
-      console.error(error);
-      alert("Gagal menyimpan pekerjaan.");
+      if (!committed && attachments.length) {
+        try {
+          await removeNoteImageObjects(attachments.map((item) => item.path));
+        } catch (cleanupError) {
+          console.error("Task image cleanup failed", cleanupError);
+        }
+      }
+      if (activeUserId.current === uid) {
+        console.error(error);
+        taskImageDraft.setError(
+          getNoteSaveError(error)
+            .replace(/Catatan/g, "Tugas")
+            .replace(/catatan/g, "tugas"),
+        );
+      }
     } finally {
-      setIsSavingTask(false);
+      noteUploadControllers.current.delete(controller);
+      if (taskUploadController.current === controller)
+        taskUploadController.current = null;
+      if (activeUserId.current === uid) {
+        setIsSavingTask(false);
+        setTaskUploadProgress(null);
+      }
     }
+  };
+
+  const deleteTaskWithImages = async (task: WorkTask) => {
+    if (!currentUser) throw new Error("Login diperlukan");
+    const prefix = `workNoteImages/${currentUser.uid}/${task.projectId}/task-${task.id}/`;
+    await removeNoteImageObjects(
+      task.attachments
+        .filter((item) => item.path.startsWith(prefix))
+        .map((item) => item.path),
+    );
+    await deleteDoc(doc(db, "workProjectTasks", task.id));
   };
 
   const toggleTaskDone = async (task: WorkTask) => {
@@ -1752,11 +2476,13 @@ export default function Home() {
   };
 
   const deleteTask = async (taskId: string) => {
+    const task = tasks.find((item) => item.id === taskId);
+    if (!task) return;
     const ok = window.confirm("Hapus pekerjaan ini?");
     if (!ok) return;
 
     try {
-      await deleteDoc(doc(db, "workProjectTasks", taskId));
+      await deleteTaskWithImages(task);
       await fetchProjects();
     } catch (error) {
       console.error(error);
@@ -1874,6 +2600,7 @@ export default function Home() {
           "Status Kasus",
           "Prioritas Kasus",
           "Dibuat",
+          "Lampiran Gambar",
         ],
         ...reportTaskRows.map((task) => [
           task.taskDate,
@@ -1886,6 +2613,7 @@ export default function Home() {
           task.projectStatus,
           task.projectPriority,
           task.createdAtText,
+          task.attachments.map((item) => item.url).join("\n"),
         ]),
       ]),
       buildExcelWorksheet("Note Progress", [
@@ -1899,6 +2627,7 @@ export default function Home() {
           "Status Kasus",
           "Prioritas Kasus",
           "Dibuat",
+          "Lampiran Gambar",
         ],
         ...reportNoteRows.map((note) => [
           note.noteDate,
@@ -1910,6 +2639,7 @@ export default function Home() {
           note.projectStatus,
           note.projectPriority,
           note.createdAtText,
+          note.attachments.map((image) => image.url).join("\n"),
         ]),
       ]),
       buildExcelWorksheet("Riwayat", [
@@ -2003,7 +2733,7 @@ export default function Home() {
           <tr>
             <td>${escapeReportCell(task.taskDate)}</td>
             <td>${escapeReportCell(task.projectTitle)}</td>
-            <td>${escapeReportCell(task.title)}</td>
+            <td>${escapeReportCell(task.title)}${task.attachments.map((image) => `<br/><a href="${escapeReportCell(image.url)}">${escapeReportCell(image.name)}</a>`).join("")}</td>
             <td>${escapeReportCell(task.isDone ? "Selesai" : "Pending")}</td>
             <td>${escapeReportCell(task.projectStatus)}</td>
             <td>${escapeReportCell(task.projectPriority)}</td>
@@ -2018,7 +2748,7 @@ export default function Home() {
           <tr>
             <td>${escapeReportCell(note.noteDate)}</td>
             <td>${escapeReportCell(note.projectTitle)}</td>
-            <td>${escapeReportCell(note.note)}</td>
+            <td>${escapeReportCell(note.note)}${note.attachments.map((image, index) => `<div><a href="${escapeReportCell(image.url)}">Gambar ${index + 1}: ${escapeReportCell(image.name)}</a></div>`).join("")}</td>
             <td>${escapeReportCell(note.projectStatus)}</td>
             <td>${escapeReportCell(note.projectPriority)}</td>
           </tr>
@@ -2118,7 +2848,9 @@ export default function Home() {
     resetForm();
     setClient(clientName === UNASSIGNED_CLIENT ? "" : clientName);
     setModule(moduleName === UNASSIGNED_MODULE ? "" : moduleName);
-    openMenuPage("tambah");
+    if (clientName && clientName !== UNASSIGNED_CLIENT) setTransactionClient(clientName);
+    if (moduleName && moduleName !== UNASSIGNED_MODULE) setIssueRows([ { ...newIssueDraft(), module: moduleName } ]);
+    openMenuPage("projects");
   };
 
   const browseCases = (clientName: string, moduleName = "") => {
@@ -2354,6 +3086,21 @@ export default function Home() {
     </button>
   );
 
+  const renderDashboardCase = (project: WorkProject) => (
+    <button type="button" onClick={() => { openMenuPage("project"); selectCase(project); }}
+      className={`group w-full rounded-2xl border ${borderColor} p-4 text-left transition-colors hover:border-emerald-400/60 hover:bg-emerald-400/5 focus-visible:outline-emerald-400`}>
+      <div className="flex items-center justify-between gap-3">
+        <p className={`truncate text-[11px] font-semibold ${smallAccent}`}>{getCaseContext(project)}</p>
+        <span className={`shrink-0 text-[11px] ${mutedText}`}>{project.status}</span>
+      </div>
+      <h3 className="mt-2 break-words text-[14px] font-semibold">{project.title}</h3>
+      <div className={`mt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] ${mutedText}`}>
+        <span>{project.requesterPic || "Belum ada PIC"}</span>
+        <span>{project.deadlineDate ? `Deadline ${formatInputDate(project.deadlineDate)}` : "Tanpa deadline"} <span aria-hidden="true">↗</span></span>
+      </div>
+    </button>
+  );
+
   if (isCheckingAuth)
     return (
       <main className={`min-h-screen ${pageBg} p-6`}>Memeriksa login...</main>
@@ -2405,21 +3152,22 @@ export default function Home() {
     );
 
   return (
-    <main className={`min-h-screen pb-24 text-[13px] leading-[1.5] ${pageBg}`}>
-      <section className="mx-auto max-w-6xl px-3 py-3 sm:px-5 sm:py-4">
-        <header className={`mb-4 ${panelClass}`}>
+    <main className={`min-h-screen text-[13px] leading-[1.5] lg:pl-60 ${pageBg}`}>
+      <section className="mx-auto max-w-[1440px] px-4 py-5 sm:px-8 sm:py-8">
+        <header className="mb-7">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0">
+              <button type="button" aria-label="Buka navigasi" aria-expanded={isNavigationMenuOpen} onClick={() => setIsNavigationMenuOpen(true)} className={`mb-3 lg:hidden ${secondaryButton}`}>☰ Menu</button>
               <p
                 className={`text-[12px] font-bold uppercase tracking-wide ${smallAccent}`}
               >
-                Office Tracker · Maintenance
+                Office Nowmy · Ruang Kerja
               </p>
-              <h1 className="mt-1 break-words text-[18px] font-semibold">
-                Hai, {username}
+              <h1 className="mt-2 break-words text-[26px] font-semibold tracking-tight">
+                Hai, {username} 👋
               </h1>
               <p className={`mt-1 text-[13px] ${mutedText}`}>
-                Client → Modul/Topik → Kasus Maintenance
+                Yuk, selesaikan satu per satu. Semua pekerjaanmu ada di sini.
               </p>
             </div>
             <div className="flex flex-wrap gap-2">
@@ -2456,33 +3204,36 @@ export default function Home() {
         )}
 
         {activeMenu === "dashboard" && (
-          <div className="space-y-3">
-            <section className={panelClass}>
-              <div className="mb-4">
-                <h2 className="text-[15px] font-semibold">
-                  Ringkasan Maintenance
-                </h2>
-                <p className={`mt-1 text-[13px] ${mutedText}`}>
-                  Gunakan filter untuk fokus ke client, modul, atau PIC
-                  tertentu.
-                </p>
+          <div className="space-y-5">
+            <div className="flex flex-wrap items-end justify-between gap-3">
+              <div>
+                <p className={`text-[11px] font-semibold uppercase tracking-[0.18em] ${smallAccent}`}>Overview</p>
+                <h2 className="mt-1 text-[20px] font-semibold tracking-tight">Fokus pekerjaanmu</h2>
               </div>
-              {renderFilters()}
-            </section>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-              {stats.map(([label, value]) => (
-                <div key={label} className={panelClass}>
-                  <p className={`text-[12px] font-medium ${mutedText}`}>
-                    {label}
-                  </p>
-                  <p className="mt-2 text-[24px] font-semibold">{value}</p>
+              <span className={`text-[12px] ${mutedText}`}>{formatInputDate(getTodayInputDate())}</span>
+            </div>
+            <div className="grid grid-cols-2 gap-3 xl:grid-cols-3">
+              {stats.map(([label, value], index) => (
+                <div key={label} className={`relative overflow-hidden rounded-2xl border ${borderColor} ${index === 0 ? "bg-emerald-400/10" : cardBg} p-4 sm:p-5`}>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className={`text-[12px] font-medium ${mutedText}`}>{label}</p>
+                    <span aria-hidden="true" className={`flex h-8 w-8 items-center justify-center rounded-xl ${index === 2 ? "bg-rose-400/10 text-rose-400" : "bg-emerald-400/10 text-emerald-500"}`}>{["◈", "◷", "!", "⋯", "✓", "☑"][index]}</span>
+                  </div>
+                  <p className="mt-3 text-[30px] font-semibold leading-none tracking-tight">{value}</p>
                 </div>
               ))}
             </div>
+            <details className={`${panelClass} group`}>
+              <summary className="flex cursor-pointer list-none items-center justify-between gap-3 font-medium">
+                <span>⌕ Cari & filter pekerjaan <span className={`ml-2 text-[11px] ${mutedText}`}>{[search, filterClient, filterModule, filterStatus, filterPriority].filter(Boolean).length > 0 ? "· Filter aktif" : "· Semua pekerjaan"}</span></span>
+                <span aria-hidden="true" className="transition-transform group-open:rotate-180">⌄</span>
+              </summary>
+              <div className="mt-4">{renderFilters()}</div>
+            </details>
             <div className="grid gap-3 lg:grid-cols-2">
               <section className={panelClass}>
                 <h2 className="mb-0.5 text-[16px] font-semibold">
-                  Perlu Dikerjakan
+                  Prioritas berikutnya
                 </h2>
                 <p className={`mb-4 text-[13px] ${mutedText}`}>
                   Kasus aktif diurutkan dari deadline paling awal.
@@ -2497,12 +3248,7 @@ export default function Home() {
                     )
                     .slice(0, 5)
                     .map((project) => (
-                      <div
-                        key={project.id}
-                        onClick={() => openMenuPage("project")}
-                      >
-                        {renderCaseCard(project)}
-                      </div>
+                      <div key={project.id}>{renderDashboardCase(project)}</div>
                     ))}
                 </div>
                 {!filteredProjects.some(
@@ -2515,7 +3261,7 @@ export default function Home() {
               </section>
               <section className={panelClass}>
                 <h2 className="mb-0.5 text-[16px] font-semibold">
-                  Menunggu Tindak Lanjut
+                  Menunggu kabar
                 </h2>
                 <p className={`mb-4 text-[13px] ${mutedText}`}>
                   Lihat hal yang masih ditunggu agar tidak terlupakan.
@@ -2525,12 +3271,7 @@ export default function Home() {
                     .filter((item) => item.status === "Menunggu")
                     .slice(0, 5)
                     .map((project) => (
-                      <div
-                        key={project.id}
-                        onClick={() => openMenuPage("project")}
-                      >
-                        {renderCaseCard(project)}
-                      </div>
+                      <div key={project.id}>{renderDashboardCase(project)}</div>
                     ))}
                 </div>
                 {!filteredProjects.some(
@@ -2546,167 +3287,60 @@ export default function Home() {
         )}
 
         {activeMenu === "client" && (
-          <div className="space-y-3">
+          <section className={panelClass}>
+            <div className="mb-5 flex items-center justify-between gap-3"><div><p className={`text-[11px] ${smallAccent}`}>MASTER</p><h2 className="text-[20px] font-semibold">Daftar Client</h2></div><button type="button" className={buttonClass} onClick={() => { setClientError(""); openMenuPage("clientAdd"); }}>＋ Tambah client</button></div>
+            <input aria-label="Cari client" placeholder="Cari nama client..." value={clientHubSearch} onChange={e => setClientHubSearch(e.target.value)} className={inputClass} />
+            {clientError && <p role="alert" className="mt-3 text-rose-500">{clientError}</p>}
+            <div className="mt-4 divide-y divide-neutral-500/15">
+              {clientOptions.filter(name => name.toLowerCase().includes(clientHubSearch.toLowerCase())).map(name => (
+                <div key={name} className="flex items-center justify-between gap-3 py-4"><div><p className="font-semibold">{name}</p><p className={`text-[12px] ${mutedText}`}>{projects.filter(item => item.client.toLowerCase() === name.toLowerCase()).length} masalah tercatat</p></div><button type="button" className={secondaryButton} onClick={() => { setTransactionClient(name); openMenuPage("projects"); }}>Lihat project ↗</button></div>
+              ))}
+              {!clientOptions.some(name => name.toLowerCase().includes(clientHubSearch.toLowerCase())) && <p className={`py-6 ${mutedText}`}>Client tidak ditemukan.</p>}
+            </div>
+          </section>
+        )}
+        {activeMenu === "clientAdd" && (
+          <section className={`mx-auto max-w-xl ${panelClass}`}><h2 className="text-[20px] font-semibold">Tambah Client</h2>
+            <form onSubmit={saveMasterClient} className="mt-5 space-y-4"><label className="block">Nama client<input autoFocus required maxLength={150} className={`mt-2 ${inputClass}`} value={newClientName} onChange={e => setNewClientName(e.target.value)} /></label>
+              {clientError && <p role="alert" className="text-rose-500">{clientError}</p>}
+              <div className="flex gap-2"><button disabled={savingClient} className={buttonClass}>{savingClient ? "Menyimpan..." : "Simpan client"}</button><button type="button" disabled={savingClient} className={secondaryButton} onClick={() => openMenuPage("client")}>Kembali</button></div>
+            </form>
+          </section>
+        )}
+        {activeMenu === "projects" && (
+          <div className="space-y-5">
             <section className={panelClass}>
-              <h2 className="text-[16px] font-semibold">Client</h2>
-              <p className={`mt-1 mb-4 text-[13px] ${mutedText}`}>
-                Pilih client untuk melihat modul/topik dan kasusnya.
-              </p>
-              <input
-                aria-label="Cari client"
-                className={inputClass}
-                value={clientHubSearch}
-                onChange={(event) => setClientHubSearch(event.target.value)}
-                placeholder="Cari nama client"
-              />
-              <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {filterClientOptions
-                  .filter((name) =>
-                    name
-                      .toLowerCase()
-                      .includes(clientHubSearch.trim().toLowerCase()),
-                  )
-                  .map((name) => {
-                    const rows = projects.filter(
-                      (item) =>
-                        (item.client || UNASSIGNED_CLIENT).toLowerCase() ===
-                        name.toLowerCase(),
-                    );
-                    return (
-                      <button
-                        type="button"
-                        key={name}
-                        onClick={() => setClientHubSelection(name)}
-                        className={`rounded-2xl border p-3 text-left ${clientHubSelection === name ? "border-emerald-400 bg-emerald-400/10" : `${borderColor} ${softCardBg}`}`}
-                      >
-                        <h3 className="break-words text-[13px] font-semibold">
-                          {name}
-                        </h3>
-                        <p className={`mt-1 text-[12px] ${mutedText}`}>
-                          {
-                            uniqueLabels(
-                              rows.map((item) => item.module).filter(Boolean),
-                            ).length
-                          }{" "}
-                          modul/topik · {rows.length} kasus
-                        </p>
-                        <div className="mt-3 flex flex-wrap gap-2 text-[12px]">
-                          <span>
-                            {
-                              rows.filter((item) => item.status !== "Selesai")
-                                .length
-                            }{" "}
-                            aktif
-                          </span>
-                          <span>
-                            ·{" "}
-                            {
-                              rows.filter((item) => item.status === "Menunggu")
-                                .length
-                            }{" "}
-                            menunggu
-                          </span>
-                          <span>
-                            ·{" "}
-                            {
-                              rows.filter((item) => item.status === "Selesai")
-                                .length
-                            }{" "}
-                            selesai
-                          </span>
-                        </div>
-                      </button>
-                    );
-                  })}
+              <p className={`text-[11px] ${smallAccent}`}>TRANSAKSI</p><h2 className="text-[20px] font-semibold">Daftar Project</h2>
+              <div className="mt-5 grid gap-4 sm:grid-cols-3">
+                <div><span className={`mb-2 block text-[12px] ${mutedText}`}>Client</span><button type="button" disabled={savingGrid} onClick={() => { setClientPickerSearch(""); setClientPickerOpen(true); }} className={`flex w-full items-center justify-between ${secondaryButton}`}>{transactionClient || "Pilih client"}<span aria-hidden="true">⌕</span></button></div>
+                <label>Kelompok form<select disabled={savingGrid} className={`mt-2 ${inputClass}`} value={formGroup} onChange={e => setFormGroup(e.target.value as FormGroup)}>{formGroups.map(group => <option key={group}>{group}</option>)}</select></label>
+                <label>Tanggal pengajuan<input disabled={savingGrid} type="date" required max={getTodayInputDate()} value={gridDate} onChange={e => setGridDate(e.target.value)} className={`mt-2 ${inputClass}`} /></label>
               </div>
             </section>
-            <section className={panelClass}>
-              <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:justify-between">
-                <div>
-                  <h2 className="text-[16px] font-semibold">
-                    {clientHubSelection}
-                  </h2>
-                  <p className={`mt-1 text-[13px] ${mutedText}`}>
-                    Modul dan topik khusus client ini.
-                  </p>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    className={secondaryButton}
-                    onClick={() => browseCases(clientHubSelection)}
-                  >
-                    Semua kasus
-                  </button>
-                  <button
-                    type="button"
-                    className={buttonClass}
-                    onClick={() => openNewCase(clientHubSelection)}
-                  >
-                    ＋ Kasus baru
-                  </button>
-                </div>
-              </div>
-              {hubModules.length === 0 ? (
-                <p className={`text-[13px] ${mutedText}`}>
-                  Belum ada modul. Tambahkan kasus pertama, lalu isi nama
-                  modul/topik yang kamu tangani.
-                </p>
-              ) : (
-                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                  {hubModules.map((name) => {
-                    const rows = hubProjects.filter(
-                      (item) =>
-                        (item.module || UNASSIGNED_MODULE).toLowerCase() ===
-                        name.toLowerCase(),
-                    );
-                    return (
-                      <div
-                        key={name}
-                        className={`min-w-0 rounded-2xl border ${borderColor} ${softCardBg} p-4`}
-                      >
-                        <h3 className="break-words text-[13px] font-semibold">
-                          {name}
-                        </h3>
-                        <p className={`mt-2 text-[13px] ${mutedText}`}>
-                          {rows.length} kasus ·{" "}
-                          {
-                            rows.filter((item) => item.status !== "Selesai")
-                              .length
-                          }{" "}
-                          aktif
-                        </p>
-                        <div className="mt-4 flex flex-wrap gap-2">
-                          <button
-                            type="button"
-                            className={secondaryButton}
-                            onClick={() =>
-                              browseCases(clientHubSelection, name)
-                            }
-                          >
-                            Lihat kasus
-                          </button>
-                          <button
-                            type="button"
-                            className={buttonClass}
-                            onClick={() =>
-                              openNewCase(clientHubSelection, name)
-                            }
-                          >
-                            ＋ Kasus
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-              <p className={`mt-4 text-[12px] ${mutedText}`}>
-                Client dan modul baru tersedia kembali setelah kasusnya
-                disimpan. Data lama tanpa modul tetap ditampilkan sebagai “Tanpa
-                modul”.
-              </p>
-            </section>
+            {!transactionClient ? <div className={`${panelClass} py-12 text-center`}><h3 className="text-[16px] font-semibold">Mulai dari client dulu</h3><p className={`mt-2 ${mutedText}`}>Pilih client untuk melihat project dan menambahkan daftar masalah.</p></div> : <>
+              <section className={panelClass}>
+                <h3 className="text-[16px] font-semibold">Tambah daftar masalah · {transactionClient}</h3><p className={`mt-1 ${mutedText}`}>Satu baris untuk satu masalah atau permintaan. Client berlaku untuk semua baris.</p>
+                <form onSubmit={saveIssueGrid} className="mt-4 space-y-4">
+                  <fieldset disabled={savingGrid} className="min-w-0"><div className="overflow-x-auto rounded-xl border border-neutral-500/20"><table className="w-full min-w-[1100px] text-left text-[12px]"><thead className={softCardBg}><tr>{["No", "Masalah / permintaan *", "Jenis", "Modul / topik *", "PIC *", "Blade / Form", "Deadline", "Prioritas", "Aksi"].map(label => <th key={label} className="p-3 font-medium">{label}</th>)}</tr></thead><tbody>
+                    {issueRows.map((row, index) => <tr key={row.id} className="border-t border-neutral-500/15"><td className="p-2">{index + 1}</td>
+                      <td className="min-w-[240px] p-2"><input aria-label={`Masalah baris ${index+1}`} required className={inputClass} value={row.title} onChange={e => updateIssueRow(row.id, {title:e.target.value})} placeholder="Tuliskan masalah atau kebutuhan" /></td>
+                      <td className="p-2"><select aria-label={`Jenis baris ${index+1}`} className={inputClass} value={row.caseKind} onChange={e => updateIssueRow(row.id, {caseKind:e.target.value as CaseKind})}>{caseKinds.map(kind => <option key={kind}>{kind}</option>)}</select></td>
+                      <td className="min-w-[160px] p-2"><input aria-label={`Modul baris ${index+1}`} required className={inputClass} value={row.module} onChange={e => updateIssueRow(row.id, {module:e.target.value})} placeholder="Contoh: Kasbank" /></td>
+                      <td className="min-w-[140px] p-2"><input aria-label={`PIC baris ${index+1}`} required className={inputClass} value={row.requesterPic} onChange={e => updateIssueRow(row.id, {requesterPic:e.target.value})} /></td>
+                      <td className="min-w-[160px] p-2"><input aria-label={`Blade baris ${index+1}`} className={inputClass} value={row.bladeForm} onChange={e => updateIssueRow(row.id, {bladeForm:e.target.value})} /></td>
+                      <td className="p-2"><input aria-label={`Deadline baris ${index+1}`} type="date" className={inputClass} value={row.deadlineDate} onChange={e => updateIssueRow(row.id, {deadlineDate:e.target.value})} /></td>
+                      <td className="p-2"><select aria-label={`Prioritas baris ${index+1}`} className={inputClass} value={row.priority} onChange={e => updateIssueRow(row.id, {priority:e.target.value as ProjectPriority})}>{priorityOptions.map(value => <option key={value}>{value}</option>)}</select></td>
+                      <td className="p-2"><button type="button" disabled={issueRows.length === 1} aria-label={`Hapus baris ${index+1}`} className={secondaryButton} onClick={() => setIssueRows(rows => rows.filter(item => item.id !== row.id))}>×</button></td>
+                    </tr>)}
+                  </tbody></table></div></fieldset>
+                  {gridError && <p role="alert" className="text-rose-500">{gridError}</p>}{gridNotice && <p role="status" className={smallAccent}>{gridNotice}</p>}
+                  <div className="flex flex-wrap justify-between gap-3"><button type="button" disabled={savingGrid || issueRows.length >= 100} className={secondaryButton} onClick={() => setIssueRows(rows => [...rows, newIssueDraft()])}>＋ Tambah baris</button><button disabled={savingGrid} className={buttonClass}>{savingGrid ? "Menyimpan..." : `Simpan ${issueRows.length} masalah`}</button></div>
+                </form>
+              </section>
+              <section className={panelClass}><h3 className="mb-4 text-[16px] font-semibold">Masalah tersimpan · {formGroup}</h3><div className="overflow-x-auto"><table className="w-full min-w-[650px] text-left"><thead><tr>{["Masalah", "Modul", "Jenis", "Status", ""].map((label,i) => <th key={i} className="p-3 text-[12px] font-medium">{label}</th>)}</tr></thead><tbody>
+                {projects.filter(item => item.client.toLowerCase() === transactionClient.toLowerCase() && (item.formGroup || "Transaksi") === formGroup).map(item => <tr key={item.id} className="border-t border-neutral-500/15"><td className="p-3">{item.title}</td><td className="p-3">{item.module || "—"}</td><td className="p-3">{item.caseKind}</td><td className="p-3">{item.status}</td><td className="p-3"><button type="button" className={secondaryButton} onClick={() => { openMenuPage("project"); selectCase(item); }}>Detail ↗</button></td></tr>)}
+              </tbody></table></div>{!projects.some(item => item.client.toLowerCase() === transactionClient.toLowerCase() && (item.formGroup || "Transaksi") === formGroup) && <p className={`p-4 ${mutedText}`}>Belum ada masalah di kelompok form ini.</p>}<p className={`mt-3 text-[11px] ${mutedText}`}>Data lama tanpa kelompok form ditampilkan di Transaksi.</p></section>
+            </>}
           </div>
         )}
 
@@ -3235,7 +3869,7 @@ export default function Home() {
                             >
                               {task.isDone ? "✓" : "○"}
                             </button>
-                            <div className="min-w-0">
+                            <div className="min-w-0 flex-1">
                               <p
                                 className={`whitespace-pre-wrap break-words text-[13px] ${task.isDone ? "line-through" : ""}`}
                               >
@@ -3244,6 +3878,10 @@ export default function Home() {
                               <p className={`mt-1 text-[12px] ${mutedText}`}>
                                 Target {formatInputDate(task.taskDate)}
                               </p>
+                              <NoteImageGallery
+                                images={task.attachments}
+                                onOpen={openNoteImages}
+                              />
                             </div>
                           </div>
                         ))}
@@ -3283,6 +3921,7 @@ export default function Home() {
                         type="date"
                         className={inputClass}
                         value={noteDate}
+                        disabled={isSavingNote}
                         onChange={(event) => setNoteDate(event.target.value)}
                         required
                       />
@@ -3292,9 +3931,15 @@ export default function Home() {
                       className={`mt-3 ${inputClass} min-h-24`}
                       value={noteText}
                       onChange={(event) => setNoteText(event.target.value)}
-                      required
+                      disabled={isSavingNote}
+                      required={noteImageDraft.images.length === 0}
                       placeholder="Progress, hasil follow up, link, atau revisi..."
                     />
+                    {noteImageDraft.error && (
+                      <p role="alert" className="mt-2 text-[12px] text-red-500">
+                        {noteImageDraft.error}
+                      </p>
+                    )}
                     <button
                       disabled={isSavingNote}
                       className={`mt-3 w-full ${buttonClass}`}
@@ -3325,6 +3970,10 @@ export default function Home() {
                           <p className="whitespace-pre-wrap break-words text-[13px] leading-5">
                             {note.note}
                           </p>
+                          <NoteImageGallery
+                            images={note.attachments}
+                            onOpen={openNoteImages}
+                          />
                         </div>
                       ))}
                     </div>
@@ -3417,6 +4066,10 @@ export default function Home() {
                             {activity.note}
                           </p>
                         )}
+                        <NoteImageGallery
+                          images={activity.attachments}
+                          onOpen={openNoteImages}
+                        />
                       </div>
                     ))}
                   </div>
@@ -3441,6 +4094,7 @@ export default function Home() {
                     aria-label="Kasus tugas"
                     className={inputClass}
                     value={taskProjectId}
+                    disabled={isSavingTask}
                     onChange={(event) => setTaskProjectId(event.target.value)}
                     required
                   >
@@ -3460,7 +4114,10 @@ export default function Home() {
                   </span>
                   <textarea
                     className={`${inputClass} min-h-24`}
+                    aria-label="Pekerjaan tugas"
                     value={taskTitle}
+                    disabled={isSavingTask}
+                    onPaste={taskImageDraft.onPaste}
                     onChange={(event) => setTaskTitle(event.target.value)}
                     required
                     placeholder="Pekerjaan kecil untuk menyelesaikan kasus"
@@ -3475,11 +4132,22 @@ export default function Home() {
                   <input
                     type="date"
                     className={inputClass}
+                    aria-label="Target tanggal tugas"
                     value={taskDate}
+                    disabled={isSavingTask}
                     onChange={(event) => setTaskDate(event.target.value)}
                     required
                   />
                 </label>
+                <NoteImagePicker
+                  draft={taskImageDraft}
+                  label="Gambar tugas"
+                  disabled={isSavingTask || taskProjectOptions.length === 0}
+                  progress={taskUploadProgress}
+                  onCancel={() => taskUploadController.current?.abort()}
+                  onOpen={openNoteImages}
+                  dark={isDarkMode}
+                />
                 <button
                   disabled={isSavingTask || taskProjectOptions.length === 0}
                   className={`w-full ${buttonClass}`}
@@ -3521,6 +4189,10 @@ export default function Home() {
                       <p className={`mt-1 text-[12px] ${mutedText}`}>
                         Target {formatInputDate(task.taskDate)}
                       </p>
+                      <NoteImageGallery
+                        images={task.attachments}
+                        onOpen={openNoteImages}
+                      />
                       <div className="mt-3 flex flex-wrap gap-2">
                         <button
                           type="button"
@@ -3567,9 +4239,15 @@ export default function Home() {
                       key={task.id}
                       className={`flex items-start justify-between gap-3 rounded-2xl ${softCardBg} p-3`}
                     >
-                      <p className="min-w-0 break-words text-[13px] line-through">
-                        {task.title}
-                      </p>
+                      <div className="min-w-0 flex-1">
+                        <p className="break-words text-[13px] line-through">
+                          {task.title}
+                        </p>
+                        <NoteImageGallery
+                          images={task.attachments}
+                          onOpen={openNoteImages}
+                        />
+                      </div>
                       <button
                         type="button"
                         className={`shrink-0 text-[12px] font-bold ${smallAccent}`}
@@ -3599,6 +4277,7 @@ export default function Home() {
                   <select
                     className={inputClass}
                     value={catatanProjectId}
+                    disabled={isSavingCatatan}
                     onChange={(event) =>
                       setCatatanProjectId(event.target.value)
                     }
@@ -3622,6 +4301,7 @@ export default function Home() {
                     type="date"
                     className={inputClass}
                     value={catatanDate}
+                    disabled={isSavingCatatan}
                     onChange={(event) => setCatatanDate(event.target.value)}
                     required
                   />
@@ -3631,9 +4311,15 @@ export default function Home() {
                   className={`${inputClass} min-h-24`}
                   value={catatanText}
                   onChange={(event) => setCatatanText(event.target.value)}
-                  required
+                  disabled={isSavingCatatan}
+                  required={catatanImageDraft.images.length === 0}
                   placeholder="Catatan, link, atau reminder follow up"
                 />
+                {catatanImageDraft.error && (
+                  <p role="alert" className="mt-2 text-[12px] text-red-500">
+                    {catatanImageDraft.error}
+                  </p>
+                )}
                 <button
                   disabled={isSavingCatatan || projects.length === 0}
                   className={`w-full ${buttonClass}`}
@@ -3685,6 +4371,10 @@ export default function Home() {
                     <p className="mt-3 whitespace-pre-wrap break-words text-[13px] leading-5">
                       {note.note}
                     </p>
+                    <NoteImageGallery
+                      images={note.attachments}
+                      onOpen={openNoteImages}
+                    />
                     <div className="mt-3 flex flex-wrap gap-2">
                       <button
                         type="button"
@@ -4075,6 +4765,129 @@ export default function Home() {
         )}
       </section>
 
+      {imageViewer && (
+        <div
+          className="fixed inset-0 z-[90] flex items-center justify-center bg-black/85 p-2 sm:p-4"
+          onClick={() => setImageViewer(null)}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="note-image-title"
+            onClick={(event) => event.stopPropagation()}
+            className={`flex h-[90dvh] max-h-[960px] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border ${borderColor} ${cardBg} shadow-2xl`}
+          >
+            <div className="flex items-center justify-between gap-3 border-b border-neutral-500/20 p-3">
+              <div className="min-w-0">
+                <h2
+                  id="note-image-title"
+                  className="truncate text-[13px] font-semibold"
+                >
+                  {imageViewer.images[imageViewer.index].name}
+                </h2>
+                <p className={`mt-1 text-[11px] ${mutedText}`}>
+                  Gambar {imageViewer.index + 1} dari{" "}
+                  {imageViewer.images.length} · {Math.round(imageZoom * 100)}%
+                </p>
+              </div>
+              <button
+                ref={imageViewerClose}
+                type="button"
+                aria-label="Tutup gambar revisi"
+                className={secondaryButton}
+                onClick={() => setImageViewer(null)}
+              >
+                ×
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto bg-black/60 p-2">
+              <div
+                className="flex h-full min-h-0 min-w-0 items-center justify-center"
+                style={
+                  imageZoom > 1
+                    ? {
+                        width: `${imageZoom * 100}%`,
+                        height: `${imageZoom * 100}%`,
+                      }
+                    : undefined
+                }
+              >
+                <img
+                  src={imageViewer.images[imageViewer.index].url}
+                  alt={imageViewer.images[imageViewer.index].name}
+                  className="h-full w-full object-contain"
+                />
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center justify-center gap-2 border-t border-neutral-500/20 p-3">
+              <button
+                type="button"
+                className={secondaryButton}
+                disabled={imageViewer.index === 0}
+                onClick={() => {
+                  setImageViewer((value) =>
+                    value ? { ...value, index: value.index - 1 } : null,
+                  );
+                  setImageZoom(1);
+                }}
+              >
+                ← Sebelumnya
+              </button>
+              <button
+                type="button"
+                aria-label="Perkecil gambar"
+                className={secondaryButton}
+                disabled={imageZoom <= 1}
+                onClick={() =>
+                  setImageZoom((value) => Math.max(1, value - 0.5))
+                }
+              >
+                −
+              </button>
+              <button
+                type="button"
+                className={secondaryButton}
+                onClick={() => setImageZoom(1)}
+              >
+                Reset zoom
+              </button>
+              <button
+                type="button"
+                aria-label="Perbesar gambar"
+                className={secondaryButton}
+                disabled={imageZoom >= 3}
+                onClick={() =>
+                  setImageZoom((value) => Math.min(3, value + 0.5))
+                }
+              >
+                +
+              </button>
+              <button
+                type="button"
+                className={secondaryButton}
+                disabled={imageViewer.index === imageViewer.images.length - 1}
+                onClick={() => {
+                  setImageViewer((value) =>
+                    value ? { ...value, index: value.index + 1 } : null,
+                  );
+                  setImageZoom(1);
+                }}
+              >
+                Berikutnya →
+              </button>
+              <a
+                className={secondaryButton}
+                href={imageViewer.images[imageViewer.index].url}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Buka ukuran asli ↗
+              </a>
+            </div>
+          </section>
+        </div>
+      )}
+
       {completionProject && (
         <div
           className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 p-3 backdrop-blur-sm"
@@ -4252,97 +5065,46 @@ export default function Home() {
         </div>
       )}
 
-      {isNavigationMenuOpen && (
-        <div
-          className="fixed inset-0 z-[70] bg-black/50 p-3 backdrop-blur-sm"
-          onClick={() => setIsNavigationMenuOpen(false)}
-        >
-          <section
-            onClick={(event) => event.stopPropagation()}
-            className={`absolute bottom-24 left-3 right-3 mx-auto max-h-[70dvh] max-w-3xl overflow-y-auto ${panelClass}`}
-          >
-            <div className="mb-4 flex items-center justify-between">
-              <h2 className="text-[16px] font-semibold">Pilih Halaman</h2>
-              <button
-                type="button"
-                className={secondaryButton}
-                aria-label="Tutup menu"
-                onClick={() => setIsNavigationMenuOpen(false)}
-              >
-                ×
-              </button>
-            </div>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-              {[
-                ["dashboard", "🏠", "Dashboard"],
-                ["client", "🏢", "Client"],
-                ["tambah", "＋", "Tambah Kasus"],
-                ["project", "🗂️", "Kasus"],
-                ["tugas", "☑️", "Tugas"],
-                ["catatan", "📝", "Catatan"],
-                ["query", "SQL", "Query"],
-                ["riwayat", "🧾", "Riwayat"],
-                ["laporan", "📊", "Laporan"],
-                ["settings", "⚙️", "Settings"],
-              ].map(([id, icon, label]) => (
-                <button
-                  type="button"
-                  key={id}
-                  onClick={() =>
-                    id === "tambah"
-                      ? openNewCase()
-                      : openMenuPage(id as ActiveMenu)
-                  }
-                  className={`rounded-2xl border ${borderColor} ${activeMenu === id ? "bg-emerald-400/10" : softCardBg} p-4 text-left`}
-                >
-                  <span aria-hidden="true" className="text-[16px]">
-                    {icon}
-                  </span>
-                  <p className="mt-2 text-[13px] font-bold">{label}</p>
-                </button>
-              ))}
+      {clientPickerOpen && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => setClientPickerOpen(false)}>
+          <section role="dialog" aria-modal="true" aria-labelledby="client-picker-title" onClick={e => e.stopPropagation()} onKeyDown={e => { if (e.key === "Escape") setClientPickerOpen(false); }} className={`flex max-h-[80dvh] w-full max-w-lg flex-col ${panelClass} shadow-2xl`}>
+            <div className="mb-4 flex items-center justify-between"><h2 id="client-picker-title" className="text-[18px] font-semibold">Pilih Client</h2><button type="button" aria-label="Tutup pilihan client" className={secondaryButton} onClick={() => setClientPickerOpen(false)}>×</button></div>
+            <input autoFocus aria-label="Cari client untuk project" className={inputClass} placeholder="Cari nama client..." value={clientPickerSearch} onChange={e => setClientPickerSearch(e.target.value)} />
+            <div className="mt-3 min-h-0 space-y-2 overflow-y-auto">{clientOptions.filter(name => name.toLowerCase().includes(clientPickerSearch.toLowerCase())).map(name => <button type="button" key={name} className={`flex w-full items-center justify-between rounded-xl border ${borderColor} p-4 text-left hover:bg-emerald-400/10`} onClick={() => { setTransactionClient(name); setClientPickerOpen(false); setGridNotice(""); }}><span>{name}</span><span aria-hidden="true">{transactionClient === name ? "✓" : "→"}</span></button>)}
+              {!clientOptions.some(name => name.toLowerCase().includes(clientPickerSearch.toLowerCase())) && <p className={`p-4 ${mutedText}`}>Client tidak ditemukan. Tambahkan melalui Master → Client.</p>}
             </div>
           </section>
         </div>
       )}
-
-      <nav
-        aria-label="Navigasi utama"
-        className={`fixed bottom-0 left-0 right-0 z-[60] border-t ${borderColor} ${isDarkMode ? "bg-[#141518]/95" : "bg-white/95"} pb-[env(safe-area-inset-bottom)] backdrop-blur`}
-      >
-        <div className="mx-auto grid max-w-3xl grid-cols-5 gap-1 px-2 py-2">
-          {[
-            ["dashboard", "🏠", "Home"],
-            ["client", "🏢", "Client"],
-            ["project", "🗂️", "Kasus"],
-            ["tugas", "☑️", "Tugas"],
-          ].map(([id, icon, label]) => (
-            <button
-              type="button"
-              key={id}
-              aria-current={activeMenu === id ? "page" : undefined}
-              onClick={() => openMenuPage(id as ActiveMenu)}
-              className={`min-h-[48px] rounded-xl px-1 py-1.5 text-[11px] font-medium ${activeMenu === id ? "bg-[#A7F3D0] text-[#111214]" : mutedText}`}
-            >
-              <div aria-hidden="true" className="mb-0.5 text-[16px]">
-                {icon}
-              </div>
-              {label}
-            </button>
-          ))}
-          <button
-            type="button"
-            aria-expanded={isNavigationMenuOpen}
-            onClick={() => setIsNavigationMenuOpen((value) => !value)}
-            className={`min-h-[48px] rounded-xl px-1 py-1.5 text-[11px] font-medium ${isNavigationMenuOpen || ["tambah", "catatan", "query", "riwayat", "laporan", "settings"].includes(activeMenu) ? "bg-[#A7F3D0] text-[#111214]" : mutedText}`}
-          >
-            <div aria-hidden="true" className="mb-0.5 text-[16px]">
-              ☰
-            </div>
-            Menu
-          </button>
+      {isNavigationMenuOpen && <button type="button" aria-label="Tutup navigasi" onClick={() => setIsNavigationMenuOpen(false)} className="fixed inset-0 z-[55] bg-black/50 backdrop-blur-sm lg:hidden" />}
+      <aside className={`fixed inset-y-0 left-0 z-[60] flex w-60 flex-col border-r ${borderColor} ${cardBg} transition-transform duration-200 ${isNavigationMenuOpen ? "translate-x-0" : "-translate-x-full"} lg:translate-x-0`}>
+        <div className="flex items-center justify-between px-5 pb-6 pt-8">
+          <div><p className={`text-[18px] font-bold tracking-tight ${smallAccent}`}>◈ Office Nowmy</p><p className={`mt-1 text-[11px] ${mutedText}`}>Sedikit lebih teratur, setiap hari.</p></div>
+          <button type="button" aria-label="Tutup navigasi" onClick={() => setIsNavigationMenuOpen(false)} className="p-2 lg:hidden">×</button>
         </div>
-      </nav>
+        <nav aria-label="Navigasi utama" className="min-h-0 flex-1 space-y-1 overflow-y-auto px-3 pb-4">
+          {[
+            ["dashboard", "◈", "Dashboard"], ["client", "▦", "Client"],
+            ["projects", "▤", "Daftar Project"], ["tugas", "☑", "Tugas"],
+            ["catatan", "✎", "Catatan"], ["query", "⌘", "Query"],
+            ["riwayat", "◷", "Riwayat"], ["laporan", "▥", "Laporan"],
+            ["settings", "⚙", "Settings"],
+          ].map(([id, icon, label]) => (
+            <div key={id}>
+            {id === "client" && <p className={`px-4 pb-2 pt-5 text-[10px] font-bold uppercase tracking-widest ${mutedText}`}>Master</p>}
+            {id === "projects" && <p className={`px-4 pb-2 pt-5 text-[10px] font-bold uppercase tracking-widest ${mutedText}`}>Transaksi</p>}
+            {id === "tugas" && <p className={`px-4 pb-2 pt-5 text-[10px] font-bold uppercase tracking-widest ${mutedText}`}>Ruang kerja</p>}
+            <button type="button" aria-current={activeMenu === id ? "page" : undefined}
+              onClick={() => { openMenuPage(id as ActiveMenu); setIsNavigationMenuOpen(false); }}
+              className={`flex min-h-[46px] w-full items-center gap-3 rounded-xl px-4 py-3 text-left text-[13px] transition-colors ${activeMenu === id ? "bg-[#A7F3D0] font-semibold text-[#111214]" : `${mutedText} hover:bg-emerald-400/10`}`}>
+              <span aria-hidden="true" className="w-5 text-center text-[18px]">{icon}</span>{label}
+            </button></div>
+          ))}
+        </nav>
+        <div className={`border-t ${borderColor} p-4`}>
+          <div className="flex items-center gap-3"><span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-400/15 font-semibold text-emerald-500">{username.slice(0, 1).toUpperCase()}</span><div className="min-w-0"><p className="truncate text-[12px] font-semibold">{username}</p><p className={`text-[11px] ${mutedText}`}>Ruang kerja pribadi</p></div></div>
+        </div>
+      </aside>
     </main>
   );
 }
