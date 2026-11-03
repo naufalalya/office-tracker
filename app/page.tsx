@@ -32,8 +32,19 @@ import {
 import { auth, db } from "../lib/firebase";
 
 type ProjectStatus =
-  "Belum Mulai" | "Proses" | "Menunggu" | "Testing" | "Hold" | "Selesai";
-type CaseKind = "Bug" | "Revisi" | "Fitur" | "Support" | "Maintenance";
+  | "Belum Mulai"
+  | "Proses"
+  | "Menunggu"
+  | "Testing"
+  | "Hold"
+  | "Selesai";
+type CaseKind =
+  | "Bug"
+  | "Revisi"
+  | "Penambahan"
+  | "Fitur"
+  | "Support"
+  | "Maintenance";
 type CaseActivity = {
   id: string;
   title: string;
@@ -43,6 +54,7 @@ type CaseActivity = {
 };
 type ProjectPriority = "Rendah" | "Normal" | "Penting" | "Urgent";
 type ActiveMenu =
+  | "masterModules"
   | "clientAdd"
   | "projects"
   | "client"
@@ -54,7 +66,8 @@ type ActiveMenu =
   | "catatan"
   | "laporan"
   | "settings"
-  | "query";
+  | "query"
+  | "upgradeNotes";
 
 type WorkSavedQuery = {
   id: string;
@@ -66,10 +79,60 @@ type WorkSavedQuery = {
   updatedAtMillis: number;
 };
 
+const upgradeTopics = [
+  "Perubahan kode",
+  "Error & Solusi",
+  "Konfigurasi",
+  "Database",
+  "Referensi",
+  "Lainnya",
+] as const;
+type UpgradeTopic = (typeof upgradeTopics)[number];
+type UpgradeSource = "PHP 7.2" | "PHP 8.2" | "Umum";
+const upgradeSources: UpgradeSource[] = ["PHP 7.2", "PHP 8.2", "Umum"];
+type UpgradeNote = {
+  id: string;
+  userId: string;
+  title: string;
+  body: string;
+  projectName: string;
+  topic: UpgradeTopic;
+  sourceVersion: UpgradeSource;
+  noteDate: string;
+  createdAtMillis: number;
+  updatedAtMillis: number;
+};
+// Upgrade notes reuse the existing user-owned snippet collection. The discriminator
+// prevents notes from appearing in Query; legacy documents remain ordinary queries.
+const isUpgradeRecord = (data: { recordType?: unknown }) =>
+  data.recordType === "upgrade-note";
+
 type FormGroup = "Master" | "Transaksi" | "Report" | "Settings";
 const formGroups: FormGroup[] = ["Master", "Transaksi", "Report", "Settings"];
-type IssueDraft = { id: string; title: string; module: string; requesterPic: string; bladeForm: string; caseKind: CaseKind; deadlineDate: string; priority: ProjectPriority };
-const newIssueDraft = (): IssueDraft => ({ id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, title: "", module: "", requesterPic: "", bladeForm: "", caseKind: "Bug", deadlineDate: "", priority: "Normal" });
+type IssueDraft = {
+  id: string;
+  title: string;
+  masukDate: string;
+  status: ProjectStatus;
+};
+const newIssueDraft = (): IssueDraft => ({
+  id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  title: "",
+  masukDate: getTodayInputDate(),
+  status: "Belum Mulai",
+});
+const workModules: CaseKind[] = ["Maintenance", "Penambahan", "Bug", "Revisi"];
+const workKind = (kind: CaseKind): CaseKind =>
+  kind === "Fitur" ? "Penambahan" : kind;
+const completionOnSave = (
+  status: ProjectStatus,
+  previous?: Pick<WorkProject, "status" | "completedDate">,
+) =>
+  status === "Selesai"
+    ? previous?.status === "Selesai" && previous.completedDate
+      ? previous.completedDate
+      : getTodayInputDate()
+    : "";
 
 type WorkProject = {
   formGroup?: FormGroup;
@@ -143,7 +206,7 @@ const defaultClients = [
   "LISNA",
   "Bhakti Kencana",
 ];
-const caseKinds: CaseKind[] = ["Bug", "Revisi", "Fitur", "Maintenance", "Support"];
+const caseKinds: CaseKind[] = [...workModules, "Fitur", "Support"];
 const UNASSIGNED_CLIENT = "(Belum dikelompokkan)";
 const UNASSIGNED_MODULE = "(Tanpa modul)";
 const cleanLabel = (value: string) => value.trim().replace(/\s+/g, " ");
@@ -695,15 +758,29 @@ export default function Home() {
   const [clientError, setClientError] = useState("");
   const [savingClient, setSavingClient] = useState(false);
   const [transactionClient, setTransactionClient] = useState("");
-  const [formGroup, setFormGroup] = useState<FormGroup>("Transaksi");
+  const [masterModules, setMasterModules] = useState<
+    Record<string, CaseKind[]>
+  >({});
+  const [masterProjectName, setMasterProjectName] = useState("");
+  const [moduleDraft, setModuleDraft] = useState<CaseKind[]>([...workModules]);
+  const [transactionModule, setTransactionModule] = useState<CaseKind | "">("");
   const [clientPickerOpen, setClientPickerOpen] = useState(false);
   const [clientPickerSearch, setClientPickerSearch] = useState("");
   const [issueRows, setIssueRows] = useState<IssueDraft[]>([newIssueDraft()]);
   const [gridError, setGridError] = useState("");
   const [gridNotice, setGridNotice] = useState("");
   const [savingGrid, setSavingGrid] = useState(false);
-  const [gridDate, setGridDate] = useState(getTodayInputDate());
   const [activeMenu, setActiveMenu] = useState<ActiveMenu>("dashboard");
+  const [projectView, setProjectView] = useState<"list" | "detail">("list");
+  const [detailTab, setDetailTab] = useState<"notes" | "tasks" | "history">(
+    "notes",
+  );
+  const navigationHistory = useRef<
+    { menu: ActiveMenu; view: "list" | "detail"; scroll: number }[]
+  >([]);
+  const [savingStatus, setSavingStatus] = useState(false);
+  const [detailNotice, setDetailNotice] = useState("");
+  const [detailError, setDetailError] = useState("");
   const [isNavigationMenuOpen, setIsNavigationMenuOpen] = useState(false);
   const [isDarkMode, setIsDarkMode] = useState(true);
 
@@ -722,10 +799,7 @@ export default function Home() {
   const [requesterPic, setRequesterPic] = useState("");
   const [caseKind, setCaseKind] = useState<CaseKind>("Bug");
   const [waitingReason, setWaitingReason] = useState("");
-  const [completedDate, setCompletedDate] = useState("");
   const [completionProjectId, setCompletionProjectId] = useState("");
-  const [completionDateInput, setCompletionDateInput] =
-    useState(getTodayInputDate());
   const [isCompleting, setIsCompleting] = useState(false);
   const [clientHubSelection, setClientHubSelection] = useState("BAKE");
   const [clientHubSearch, setClientHubSearch] = useState("");
@@ -775,6 +849,41 @@ export default function Home() {
   const [viewingSavedQueryId, setViewingSavedQueryId] = useState("");
   const [busySavedQueryId, setBusySavedQueryId] = useState("");
 
+  const upgradeFetchGeneration = useRef(0);
+  const [upgradeNotes, setUpgradeNotes] = useState<UpgradeNote[]>([]);
+  const [upgradeView, setUpgradeView] = useState<"list" | "read" | "edit">(
+    "list",
+  );
+  const [upgradeSelectedId, setUpgradeSelectedId] = useState("");
+  const [upgradeEditingId, setUpgradeEditingId] = useState("");
+  const [upgradeTitle, setUpgradeTitle] = useState("");
+  const [upgradeBody, setUpgradeBody] = useState("");
+  const [upgradeProject, setUpgradeProject] = useState("");
+  const [upgradeTopic, setUpgradeTopic] =
+    useState<UpgradeTopic>("Perubahan kode");
+  const [upgradeSource, setUpgradeSource] = useState<UpgradeSource>("Umum");
+  const [upgradeDate, setUpgradeDate] = useState(getTodayInputDate());
+  const [upgradeSearch, setUpgradeSearch] = useState("");
+  const [upgradeFilter, setUpgradeFilter] = useState("");
+  const [upgradeSourceFilter, setUpgradeSourceFilter] = useState("");
+  const [upgradeLoading, setUpgradeLoading] = useState(false);
+  const [upgradeSaving, setUpgradeSaving] = useState(false);
+  const [upgradeDeleting, setUpgradeDeleting] = useState("");
+  const [upgradeError, setUpgradeError] = useState("");
+  const [upgradeNotice, setUpgradeNotice] = useState("");
+  const selectedUpgradeNote = upgradeNotes.find(
+    (item) => item.id === upgradeSelectedId,
+  );
+  const filteredUpgradeNotes = upgradeNotes.filter(
+    (item) =>
+      (!upgradeFilter || item.topic === upgradeFilter) &&
+      (!upgradeSourceFilter || item.sourceVersion === upgradeSourceFilter) &&
+      [item.title, item.body, item.projectName, item.topic, item.sourceVersion]
+        .join(" ")
+        .toLowerCase()
+        .includes(upgradeSearch.trim().toLowerCase()),
+  );
+
   const username = getUsernameFromEmail(currentUser?.email);
 
   const pageBg = isDarkMode
@@ -799,13 +908,21 @@ export default function Home() {
     ...masterClients,
     ...projects.map((item) => item.client),
   ]);
-  const moduleOptions = uniqueLabels(
-    projects
-      .filter(
-        (item) =>
-          item.client.toLowerCase() === normalizeClient(client).toLowerCase(),
-      )
-      .map((item) => item.module),
+  const modulesFor = (name: string): CaseKind[] =>
+    uniqueLabels([
+      ...(masterModules[normalizeClient(name).toLowerCase()] ?? workModules),
+      ...projects
+        .filter(
+          (item) =>
+            item.client.toLowerCase() === normalizeClient(name).toLowerCase(),
+        )
+        .map((item) => workKind(item.caseKind)),
+    ]) as CaseKind[];
+  const moduleOptions = modulesFor(client);
+  const transactionRecords = projects.filter(
+    (item) =>
+      item.client.toLowerCase() === transactionClient.toLowerCase() &&
+      workKind(item.caseKind) === transactionModule,
   );
   const filterClientOptions = [
     ...clientOptions,
@@ -1285,7 +1402,6 @@ export default function Home() {
     setRequesterPic("");
     setCaseKind("Bug");
     setWaitingReason("");
-    setCompletedDate("");
     setMasukDate(getTodayInputDate());
     setDeadlineDate("");
     setStatus("Belum Mulai");
@@ -1295,76 +1411,291 @@ export default function Home() {
 
   useEffect(() => {
     setMasterClients([]);
+    setMasterModules({});
+    setTransactionModule("");
     setTransactionClient("");
     setClientPickerOpen(false);
     setIssueRows([newIssueDraft()]);
-    setGridError(""); setGridNotice(""); setClientError("");
+    setGridError("");
+    setGridNotice("");
+    setClientError("");
     if (!currentUser) return;
     let cancelled = false;
-    getDocs(query(collection(db, "workClients"), where("userId", "==", currentUser.uid)))
-      .then(snapshot => { if (!cancelled) setMasterClients(snapshot.docs.map(item => String(item.data().name || "")).filter(Boolean)); })
-      .catch(() => { if (!cancelled) setClientError("Master client belum dapat dimuat. Pastikan Firestore Rules mengizinkan workClients untuk pemilik userId."); });
-    return () => { cancelled = true; };
+    getDocs(
+      query(
+        collection(db, "workClients"),
+        where("userId", "==", currentUser.uid),
+      ),
+    )
+      .then((snapshot) => {
+        if (cancelled) return;
+        setMasterClients(
+          snapshot.docs
+            .map((item) => String(item.data().name || ""))
+            .filter(Boolean),
+        );
+        setMasterModules(
+          Object.fromEntries(
+            snapshot.docs.map((item) => {
+              const data = item.data();
+              return [
+                normalizeClient(String(data.name || "")).toLowerCase(),
+                Array.isArray(data.modules)
+                  ? data.modules
+                      .filter((kind: CaseKind) => caseKinds.includes(kind))
+                      .map(workKind)
+                  : [...workModules],
+              ];
+            }),
+          ),
+        );
+      })
+      .catch(() => {
+        if (!cancelled)
+          setClientError(
+            "Master client belum dapat dimuat. Pastikan Firestore Rules mengizinkan workClients untuk pemilik userId.",
+          );
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [currentUser]);
 
   const saveMasterClient = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!currentUser || savingClient) return;
     const name = normalizeClient(newClientName);
-    if (!name) { setClientError("Nama client wajib diisi."); return; }
-    if (clientOptions.some(item => item.toLowerCase() === name.toLowerCase())) { setClientError("Client sudah ada di daftar."); return; }
-    setSavingClient(true); setClientError("");
+    if (!name) {
+      setClientError("Nama project wajib diisi.");
+      return;
+    }
+    if (
+      clientOptions.some((item) => item.toLowerCase() === name.toLowerCase())
+    ) {
+      setClientError("Project sudah ada di daftar.");
+      return;
+    }
+    setSavingClient(true);
+    setClientError("");
     const owner = currentUser.uid;
     try {
-      await setDoc(doc(db, "workClients", `${owner}_${encodeURIComponent(name.toLowerCase())}`), { userId: owner, name, createdAt: serverTimestamp() });
+      await setDoc(
+        doc(
+          db,
+          "workClients",
+          `${owner}_${encodeURIComponent(name.toLowerCase())}`,
+        ),
+        { userId: owner, name, createdAt: serverTimestamp() },
+      );
       if (activeUserId.current !== owner) return;
-      setMasterClients(previous => uniqueLabels([...previous, name]));
-      setNewClientName(""); openMenuPage("client");
-    } catch { if (activeUserId.current === owner) setClientError("Gagal menyimpan client. Cek koneksi dan izin workClients di Firestore."); }
-    finally { setSavingClient(false); }
+      setMasterClients((previous) => uniqueLabels([...previous, name]));
+      setNewClientName("");
+      openMenuPage("client");
+    } catch {
+      if (activeUserId.current === owner)
+        setClientError(
+          "Gagal menyimpan project. Cek koneksi dan izin workClients di Firestore.",
+        );
+    } finally {
+      setSavingClient(false);
+    }
+  };
+
+  const saveModuleMaster = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!currentUser || savingClient) return;
+    const name = normalizeClient(masterProjectName);
+    if (!name || !moduleDraft.length) {
+      setClientError("Pilih project dan minimal satu modul.");
+      return;
+    }
+    const owner = currentUser.uid;
+    setSavingClient(true);
+    setClientError("");
+    try {
+      await setDoc(
+        doc(
+          db,
+          "workClients",
+          `${owner}_${encodeURIComponent(name.toLowerCase())}`,
+        ),
+        {
+          userId: owner,
+          name,
+          modules: moduleDraft,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true },
+      );
+      if (activeUserId.current !== owner) return;
+      setMasterModules((previous) => ({
+        ...previous,
+        [name.toLowerCase()]: [...moduleDraft],
+      }));
+      setMasterClients((previous) => uniqueLabels([...previous, name]));
+      setTransactionModule("");
+      openMenuPage("client");
+    } catch {
+      if (activeUserId.current === owner)
+        setClientError("Gagal menyimpan modul project. Silakan coba lagi.");
+    } finally {
+      setSavingClient(false);
+    }
   };
 
   const updateIssueRow = (id: string, patch: Partial<IssueDraft>) => {
-    setIssueRows(rows => rows.map(row => row.id === id ? { ...row, ...patch } : row));
+    setIssueRows((rows) =>
+      rows.map((row) => (row.id === id ? { ...row, ...patch } : row)),
+    );
     setGridNotice("");
   };
   const saveIssueGrid = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!currentUser || savingGrid) return;
-    setGridError(""); setGridNotice("");
-    if (!transactionClient || !gridDate || gridDate > getTodayInputDate()) { setGridError("Pilih client dan tanggal pengajuan yang valid."); return; }
-    if (!issueRows.length || issueRows.length > 100 || issueRows.some(row => !row.title.trim() || !row.module.trim() || !row.requesterPic.trim())) {
-      setGridError("Isi masalah, modul/topik, dan PIC pada setiap baris. Maksimal 100 baris sekali simpan."); return;
+    setGridError("");
+    setGridNotice("");
+    if (
+      !clientOptions.includes(transactionClient) ||
+      !transactionModule ||
+      !modulesFor(transactionClient).includes(transactionModule)
+    ) {
+      setGridError("Pilih project dan modul dari master terlebih dahulu.");
+      return;
+    }
+    if (
+      !issueRows.length ||
+      issueRows.length > 100 ||
+      issueRows.some(
+        (row) =>
+          !row.title.trim() ||
+          !row.masukDate ||
+          row.masukDate > getTodayInputDate() ||
+          !statusOptions.includes(row.status),
+      )
+    ) {
+      setGridError(
+        "Isi deskripsi, tanggal masuk (maksimal hari ini), dan status pada setiap baris. Maksimal 100 baris.",
+      );
+      return;
     }
     setSavingGrid(true);
     const owner = currentUser.uid;
     try {
       const batch = writeBatch(db);
-      issueRows.forEach(row => {
+      issueRows.forEach((row) => {
         batch.set(doc(collection(db, "workProjects")), {
-          userId: owner, client: transactionClient, formGroup,
-          title: row.title.trim(), module: cleanLabel(row.module), requesterPic: row.requesterPic.trim(),
-          bladeForm: row.bladeForm.trim(), caseKind: row.caseKind, masukDate: gridDate,
-          deadlineDate: row.deadlineDate, priority: row.priority, status: "Belum Mulai",
-          notes: "", waitingReason: "", completedDate: "", activityHistory: [],
-          createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
+          userId: owner,
+          client: transactionClient,
+          formGroup: "Transaksi",
+          title: row.title.trim(),
+          module: transactionModule,
+          caseKind: transactionModule,
+          requesterPic: "",
+          bladeForm: "",
+          masukDate: row.masukDate,
+          deadlineDate: "",
+          priority: "Normal",
+          status: row.status,
+          notes: "",
+          waitingReason: "",
+          completedDate: completionOnSave(row.status),
+          activityHistory: [
+            makeActivity("Pekerjaan dicatat", row.title.trim()),
+          ],
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
         });
       });
       await batch.commit();
       if (activeUserId.current !== owner) return;
-      setIssueRows([newIssueDraft()]); setGridNotice("Semua baris berhasil disimpan. Client dan kelompok form tetap dipilih.");
+      setIssueRows([newIssueDraft()]);
+      setGridNotice(
+        "Pekerjaan berhasil disimpan. Project dan modul tetap dipilih.",
+      );
       await fetchProjects();
-    } catch { if (activeUserId.current === owner) setGridError("Gagal menyimpan daftar masalah. Baris tetap tersedia untuk dicoba lagi."); }
-    finally { setSavingGrid(false); }
+    } catch {
+      if (activeUserId.current === owner)
+        setGridError(
+          "Gagal menyimpan daftar masalah. Baris tetap tersedia untuk dicoba lagi.",
+        );
+    } finally {
+      setSavingGrid(false);
+    }
   };
 
   const openMenuPage = (menuId: ActiveMenu) => {
+    if (menuId !== activeMenu) {
+      navigationHistory.current.push({
+        menu: activeMenu,
+        view: projectView,
+        scroll: window.scrollY,
+      });
+    }
+    if (menuId === "project") setProjectView("detail");
     setActiveMenu(menuId);
     setIsNavigationMenuOpen(false);
+    window.setTimeout(
+      () => window.scrollTo({ top: 0, behavior: "instant" }),
+      0,
+    );
+  };
 
-    window.setTimeout(() => {
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    }, 0);
+  const goBack = () => {
+    const previous = navigationHistory.current.pop();
+    setActiveMenu(previous?.menu ?? "projects");
+    setProjectView(previous?.view ?? "list");
+    setIsNavigationMenuOpen(false);
+    window.setTimeout(
+      () =>
+        window.scrollTo({ top: previous?.scroll ?? 0, behavior: "instant" }),
+      0,
+    );
+  };
+
+  const changeWorkStatus = async (
+    project: WorkProject,
+    next: ProjectStatus,
+  ) => {
+    if (!currentUser || savingStatus || next === project.status) return;
+    const owner = currentUser.uid;
+    setSavingStatus(true);
+    setDetailNotice("");
+    setDetailError("");
+    try {
+      await updateDoc(doc(db, "workProjects", project.id), {
+        status: next,
+        completedDate: completionOnSave(next, project),
+        waitingReason: next === "Menunggu" ? project.waitingReason : "",
+        updatedAt: serverTimestamp(),
+        activityHistory: arrayUnion(
+          makeActivity("Status diperbarui", `${project.status} → ${next}`),
+        ),
+      });
+      if (activeUserId.current !== owner) return;
+      setProjects((items) =>
+        items.map((item) =>
+          item.id === project.id
+            ? {
+                ...item,
+                status: next,
+                completedDate: completionOnSave(next, project),
+              }
+            : item,
+        ),
+      );
+      if (next !== "Selesai") setTaskProjectId(project.id);
+      setDetailNotice(
+        next === "Selesai"
+          ? "Pekerjaan selesai. Tanggal selesai sudah tercatat otomatis."
+          : "Status berhasil diperbarui.",
+      );
+      await fetchProjects();
+    } catch {
+      if (activeUserId.current === owner)
+        setDetailError("Status belum tersimpan. Coba lagi.");
+    } finally {
+      setSavingStatus(false);
+    }
   };
 
   const fetchProjects = async () => {
@@ -1410,7 +1741,9 @@ export default function Home() {
             id: item.id,
             userId: data.userId ?? "",
             title: data.title ?? "",
-            formGroup: formGroups.includes(data.formGroup) ? data.formGroup : undefined,
+            formGroup: formGroups.includes(data.formGroup)
+              ? data.formGroup
+              : undefined,
             client: normalizeClient(data.client ?? ""),
             module: cleanLabel(data.module ?? ""),
             bladeForm: data.bladeForm ?? "",
@@ -1554,6 +1887,12 @@ export default function Home() {
         noteUploadControllers.current.forEach((controller) =>
           controller.abort(),
         );
+      if (activeUserId.current !== (user?.uid ?? null)) {
+        navigationHistory.current = [];
+        setDetailNotice("");
+        setDetailError("");
+        setDetailTab("notes");
+      }
       activeUserId.current = user?.uid ?? null;
       setCurrentUser(user);
       setIsCheckingAuth(false);
@@ -1589,6 +1928,237 @@ export default function Home() {
     if (!currentUser) return;
     fetchProjects();
   }, [currentUser?.uid]);
+
+  const resetUpgradeDraft = () => {
+    setUpgradeEditingId("");
+    setUpgradeTitle("");
+    setUpgradeBody("");
+    setUpgradeProject("");
+    setUpgradeTopic("Perubahan kode");
+    setUpgradeSource("Umum");
+    setUpgradeDate(getTodayInputDate());
+  };
+
+  const fetchUpgradeNotes = async () => {
+    if (!currentUser) return;
+    const owner = currentUser.uid;
+    const generation = ++upgradeFetchGeneration.current;
+    setUpgradeLoading(true);
+    setUpgradeError("");
+    try {
+      const snapshot = await getDocs(
+        query(collection(db, "workSavedQueries"), where("userId", "==", owner)),
+      );
+      if (
+        activeUserId.current !== owner ||
+        upgradeFetchGeneration.current !== generation
+      )
+        return;
+      setUpgradeNotes(
+        snapshot.docs
+          .filter((item) => isUpgradeRecord(item.data()))
+          .map((item): UpgradeNote => {
+            const data = item.data();
+            return {
+              id: item.id,
+              userId: owner,
+              title:
+                typeof data.title === "string" ? data.title : "Tanpa judul",
+              body: typeof data.queryText === "string" ? data.queryText : "",
+              projectName: typeof data.client === "string" ? data.client : "",
+              topic: upgradeTopics.includes(data.topic)
+                ? data.topic
+                : "Lainnya",
+              sourceVersion: upgradeSources.includes(data.sourceVersion)
+                ? data.sourceVersion
+                : "Umum",
+              noteDate: typeof data.noteDate === "string" ? data.noteDate : "",
+              createdAtMillis:
+                data.createdAt instanceof Timestamp
+                  ? data.createdAt.toMillis()
+                  : 0,
+              updatedAtMillis:
+                data.updatedAt instanceof Timestamp
+                  ? data.updatedAt.toMillis()
+                  : 0,
+            };
+          })
+          .sort((a, b) => b.updatedAtMillis - a.updatedAtMillis),
+      );
+    } catch (error) {
+      if (
+        activeUserId.current !== owner ||
+        upgradeFetchGeneration.current !== generation
+      )
+        return;
+      setUpgradeError(
+        (error as { code?: string }).code?.includes("permission-denied")
+          ? "Catatan belum dapat diakses. Pastikan akses workSavedQueries untuk akunmu sudah diizinkan di Firestore Rules."
+          : "Catatan belum dapat dimuat. Periksa koneksi lalu klik Refresh.",
+      );
+    } finally {
+      if (
+        activeUserId.current === owner &&
+        upgradeFetchGeneration.current === generation
+      )
+        setUpgradeLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    ++upgradeFetchGeneration.current;
+    setUpgradeNotes([]);
+    setUpgradeView("list");
+    setUpgradeSelectedId("");
+    resetUpgradeDraft();
+    setUpgradeSearch("");
+    setUpgradeFilter("");
+    setUpgradeSourceFilter("");
+    setUpgradeError("");
+    setUpgradeNotice("");
+    setUpgradeSaving(false);
+    setUpgradeLoading(false);
+    setUpgradeDeleting("");
+  }, [currentUser?.uid]);
+  useEffect(() => {
+    if (currentUser && activeMenu === "upgradeNotes") void fetchUpgradeNotes();
+  }, [currentUser?.uid, activeMenu]);
+
+  const openUpgradeEditor = (note?: UpgradeNote) => {
+    if (upgradeSaving || upgradeDeleting) return;
+    if (note) {
+      setUpgradeEditingId(note.id);
+      setUpgradeTitle(note.title);
+      setUpgradeBody(note.body);
+      setUpgradeProject(note.projectName);
+      setUpgradeTopic(note.topic);
+      setUpgradeSource(note.sourceVersion);
+      setUpgradeDate(note.noteDate || getTodayInputDate());
+    } else {
+      resetUpgradeDraft();
+    }
+    setUpgradeError("");
+    setUpgradeNotice("");
+    setUpgradeView("edit");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const saveUpgradeNote = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!currentUser || upgradeSaving || upgradeDeleting) return;
+    if (!upgradeTitle.trim() || !upgradeBody.trim() || !upgradeDate) {
+      setUpgradeError("Isi judul, tanggal, dan catatan terlebih dahulu.");
+      return;
+    }
+    if (upgradeTitle.trim().length > 200 || upgradeBody.length > 100000) {
+      setUpgradeError(
+        "Judul maksimal 200 karakter dan isi maksimal 100.000 karakter.",
+      );
+      return;
+    }
+    const owner = currentUser.uid;
+    const previous = upgradeNotes.find((item) => item.id === upgradeEditingId);
+    if (upgradeEditingId && (!previous || previous.userId !== owner)) {
+      setUpgradeError(
+        "Catatan tidak ditemukan. Muat ulang daftar terlebih dahulu.",
+      );
+      return;
+    }
+    const draft = {
+      title: upgradeTitle.trim(),
+      body: upgradeBody,
+      projectName: upgradeProject.trim(),
+      topic: upgradeTopic,
+      sourceVersion: upgradeSource,
+      noteDate: upgradeDate,
+    };
+    setUpgradeSaving(true);
+    setUpgradeError("");
+    setUpgradeNotice("");
+    try {
+      const payload = {
+        userId: owner,
+        recordType: "upgrade-note",
+        title: draft.title,
+        queryText: draft.body,
+        client: draft.projectName,
+        topic: draft.topic,
+        sourceVersion: draft.sourceVersion,
+        noteDate: draft.noteDate,
+        updatedAt: serverTimestamp(),
+      };
+      let id = upgradeEditingId;
+      if (id) await updateDoc(doc(db, "workSavedQueries", id), payload);
+      else
+        id = (
+          await addDoc(collection(db, "workSavedQueries"), {
+            ...payload,
+            createdAt: serverTimestamp(),
+          })
+        ).id;
+      if (activeUserId.current !== owner) return;
+      // Discard any older in-flight refresh before adding the confirmed saved row.
+      ++upgradeFetchGeneration.current;
+      setUpgradeLoading(false);
+      const row: UpgradeNote = {
+        ...draft,
+        id,
+        userId: owner,
+        createdAtMillis: previous?.createdAtMillis || Date.now(),
+        updatedAtMillis: Date.now(),
+      };
+      setUpgradeNotes((items) => [
+        row,
+        ...items.filter((item) => item.id !== id),
+      ]);
+      setUpgradeSelectedId(id);
+      setUpgradeView("read");
+      resetUpgradeDraft();
+      setUpgradeNotice(
+        previous
+          ? "Perubahan catatan berhasil disimpan."
+          : "Catatan berhasil disimpan.",
+      );
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch {
+      if (activeUserId.current === owner)
+        setUpgradeError(
+          "Catatan belum tersimpan. Cek koneksi dan akses workSavedQueries di Firestore Rules. Isi catatan masih tersedia untuk dicoba lagi.",
+        );
+    } finally {
+      if (activeUserId.current === owner) setUpgradeSaving(false);
+    }
+  };
+
+  const deleteUpgradeNote = async (note: UpgradeNote) => {
+    if (
+      !currentUser ||
+      note.userId !== currentUser.uid ||
+      upgradeSaving ||
+      upgradeDeleting
+    )
+      return;
+    if (!window.confirm(`Hapus catatan “${note.title}”?`)) return;
+    const owner = currentUser.uid;
+    setUpgradeDeleting(note.id);
+    setUpgradeError("");
+    setUpgradeNotice("");
+    try {
+      await deleteDoc(doc(db, "workSavedQueries", note.id));
+      if (activeUserId.current !== owner) return;
+      ++upgradeFetchGeneration.current;
+      setUpgradeLoading(false);
+      setUpgradeNotes((items) => items.filter((item) => item.id !== note.id));
+      setUpgradeView("list");
+      setUpgradeSelectedId("");
+      setUpgradeNotice("Catatan berhasil dihapus.");
+    } catch {
+      if (activeUserId.current === owner)
+        setUpgradeError("Catatan belum dapat dihapus. Silakan coba lagi.");
+    } finally {
+      if (activeUserId.current === owner) setUpgradeDeleting("");
+    }
+  };
 
   const savedQueryClientOptions = uniqueLabels([
     ...clientOptions,
@@ -1626,6 +2196,7 @@ export default function Home() {
         return;
       setSavedQueries(
         snapshot.docs
+          .filter((item) => !isUpgradeRecord(item.data()))
           .map((item): WorkSavedQuery => {
             const data = item.data();
             const createdAtMillis =
@@ -1981,15 +2552,8 @@ export default function Home() {
     }
 
     if (isSaving) return;
-    if (
-      !cleanLabel(client) ||
-      !cleanLabel(module) ||
-      !requesterPic.trim() ||
-      !masukDate
-    ) {
-      alert(
-        "Isi client, modul/topik, PIC peminta, dan tanggal pengajuan dulu ya.",
-      );
+    if (!cleanLabel(client) || !cleanLabel(module) || !masukDate) {
+      alert("Pilih project, modul, dan tanggal masuk dulu ya.");
       return;
     }
     if (masukDate > getTodayInputDate()) {
@@ -1997,19 +2561,16 @@ export default function Home() {
       return;
     }
     if (
-      status === "Selesai" &&
-      (!completedDate ||
-        completedDate < masukDate ||
-        completedDate > getTodayInputDate())
+      !clientOptions.includes(client) ||
+      !modulesFor(client).includes(caseKind)
     ) {
-      alert("Pilih tanggal selesai antara tanggal pengajuan dan hari ini.");
+      alert("Pilih project dan modul dari master.");
       return;
     }
-    if (status === "Menunggu" && !waitingReason.trim()) {
-      alert("Isi keterangan yang sedang ditunggu ya.");
-      return;
-    }
-
+    const previousRecord = projects.find(
+      (item) => item.id === editingProjectId,
+    );
+    const savedCompletedDate = completionOnSave(status, previousRecord);
     try {
       setIsSaving(true);
 
@@ -2022,14 +2583,19 @@ export default function Home() {
               item.toLowerCase() === normalizeClient(client).toLowerCase(),
           ) ?? normalizeClient(client),
         module:
-          moduleOptions.find(
-            (item) => item.toLowerCase() === cleanLabel(module).toLowerCase(),
-          ) ?? cleanLabel(module),
+          previousRecord &&
+          workKind(previousRecord.caseKind) === caseKind &&
+          previousRecord.client === client
+            ? previousRecord.module
+            : (moduleOptions.find(
+                (item) =>
+                  item.toLowerCase() === cleanLabel(module).toLowerCase(),
+              ) ?? cleanLabel(module)),
         bladeForm: bladeForm.trim(),
         requesterPic: requesterPic.trim(),
         caseKind,
         waitingReason: status === "Menunggu" ? waitingReason.trim() : "",
-        completedDate: status === "Selesai" ? completedDate : "",
+        completedDate: savedCompletedDate,
         masukDate,
         deadlineDate: deadlineDate || "",
         status,
@@ -2044,7 +2610,7 @@ export default function Home() {
         const completionChanged =
           status === "Selesai" &&
           (previous?.status !== "Selesai" ||
-            previous?.completedDate !== completedDate);
+            previous?.completedDate !== savedCompletedDate);
         const event = makeActivity(
           completionChanged
             ? "Kasus selesai / tanggal selesai diperbarui"
@@ -2052,7 +2618,7 @@ export default function Home() {
               ? "Kasus dibuka kembali"
               : "Kasus diperbarui",
           `${previous?.status ?? "—"} → ${status}. PIC peminta: ${requesterPic.trim()}.${status === "Menunggu" ? ` Menunggu: ${waitingReason.trim()}` : ""}`,
-          completionChanged ? completedDate : getTodayInputDate(),
+          completionChanged ? savedCompletedDate : getTodayInputDate(),
         );
         await updateDoc(doc(db, "workProjects", editingProjectId), {
           ...payload,
@@ -2069,7 +2635,7 @@ export default function Home() {
                   makeActivity(
                     "Kasus selesai",
                     `PIC peminta: ${requesterPic.trim()}`,
-                    completedDate,
+                    savedCompletedDate,
                   ),
                 ]
               : [],
@@ -2079,12 +2645,16 @@ export default function Home() {
       }
 
       resetForm();
-      setActiveMenu("project");
+      setProjectView("detail");
+      if (activeMenu === "tambah") goBack();
+      else openMenuPage("project");
       setSearch("");
-      setFilterClient(payload.client);
-      setFilterModule(payload.module);
-      setFilterStatus("");
-      setFilterPriority("");
+      if (!editingProjectId) {
+        setFilterClient(payload.client);
+        setFilterModule(payload.module);
+        setFilterStatus("");
+        setFilterPriority("");
+      }
       await fetchProjects();
       if (activeUserId.current === currentUser.uid)
         setSelectedProjectId(savedProjectId);
@@ -2100,38 +2670,29 @@ export default function Home() {
     setEditingProjectId(project.id);
     setTitle(project.title);
     setClient(project.client);
-    setModule(project.module);
+    setModule(project.module || workKind(project.caseKind));
     setBladeForm(project.bladeForm);
     setRequesterPic(project.requesterPic);
-    setCaseKind(project.caseKind);
+    setCaseKind(workKind(project.caseKind));
     setWaitingReason(project.waitingReason);
-    setCompletedDate(
-      project.completedDate ||
-        (project.status === "Selesai" ? getTodayInputDate() : ""),
-    );
     setMasukDate(project.masukDate);
     setDeadlineDate(project.deadlineDate);
     setStatus(project.status);
     setPriority(project.priority);
     setProjectNotes(project.notes);
-    setActiveMenu("tambah");
+    openMenuPage("tambah");
   };
 
   const openCompletion = (project: WorkProject) => {
-    setCompletionDateInput(project.completedDate || getTodayInputDate());
     setCompletionProjectId(project.id);
   };
 
   const completeProject = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!currentUser || !completionProject || isCompleting) return;
-    if (
-      !completionDateInput ||
-      (completionProject.masukDate &&
-        completionDateInput < completionProject.masukDate) ||
-      completionDateInput > getTodayInputDate()
-    ) {
-      alert("Tanggal selesai harus antara tanggal pengajuan dan hari ini.");
+    const completionDateInput = completionOnSave("Selesai", completionProject);
+    if (completionProject.masukDate > completionDateInput) {
+      alert("Tanggal masuk tidak boleh di masa depan.");
       return;
     }
     try {
@@ -2192,7 +2753,10 @@ export default function Home() {
       await Promise.all(relatedNotes.map((item) => deleteNoteWithImages(item)));
       await deleteDoc(doc(db, "workProjects", project.id));
 
-      if (selectedProjectId === project.id) setSelectedProjectId("");
+      if (selectedProjectId === project.id) {
+        setSelectedProjectId("");
+        goBack();
+      }
       await fetchProjects();
       alert("Kasus berhasil dihapus.");
     } catch (error) {
@@ -2848,8 +3412,16 @@ export default function Home() {
     resetForm();
     setClient(clientName === UNASSIGNED_CLIENT ? "" : clientName);
     setModule(moduleName === UNASSIGNED_MODULE ? "" : moduleName);
-    if (clientName && clientName !== UNASSIGNED_CLIENT) setTransactionClient(clientName);
-    if (moduleName && moduleName !== UNASSIGNED_MODULE) setIssueRows([ { ...newIssueDraft(), module: moduleName } ]);
+    if (clientName && clientName !== UNASSIGNED_CLIENT)
+      setTransactionClient(clientName);
+    setTransactionModule(
+      workModules.includes(moduleName as CaseKind)
+        ? (moduleName as CaseKind)
+        : "",
+    );
+    setIssueRows([newIssueDraft()]);
+    setGridError("");
+    setGridNotice("");
     openMenuPage("projects");
   };
 
@@ -2869,16 +3441,24 @@ export default function Home() {
     );
     setSelectedProjectId(first?.id ?? "");
     openMenuPage("project");
+    setProjectView("list");
   };
 
   const selectCase = (project: WorkProject) => {
+    if (activeMenu === "project" && projectView === "list") {
+      navigationHistory.current.push({
+        menu: "project",
+        view: "list",
+        scroll: window.scrollY,
+      });
+    }
+    openMenuPage("project");
+    setProjectView("detail");
     setSelectedProjectId(project.id);
-    window.setTimeout(() => {
-      if (window.innerWidth < 1024)
-        document
-          .getElementById("case-detail")
-          ?.scrollIntoView({ behavior: "smooth", block: "start" });
-    }, 0);
+    setTaskProjectId(project.id);
+    setDetailTab("notes");
+    setDetailNotice("");
+    setDetailError("");
   };
 
   const resetFilters = () => {
@@ -3044,59 +3624,57 @@ export default function Home() {
       type="button"
       key={project.id}
       onClick={() => selectCase(project)}
-      className={`w-full min-w-0 rounded-2xl border p-3 text-left ${selected ? "border-emerald-400 bg-emerald-400/10" : `${borderColor} ${softCardBg}`}`}
+      className={`w-full rounded-xl border p-4 text-left transition-colors hover:border-emerald-400/60 ${selected ? "border-emerald-400 bg-emerald-400/10" : borderColor}`}
     >
-      <p className={`mb-2 break-words text-[12px] font-bold ${smallAccent}`}>
-        {getCaseContext(project)}
-      </p>
-      <h3 className="break-words text-[13px] font-semibold">{project.title}</h3>
-      <p className={`mt-2 break-words text-[12px] ${mutedText}`}>
-        PIC peminta: {project.requesterPic || "Belum diisi"}
-      </p>
-      {project.bladeForm && (
-        <p className={`mt-1 break-all text-[12px] ${mutedText}`}>
-          Blade/Form: {project.bladeForm}
+      <div className="flex items-center justify-between gap-3">
+        <p className={`text-xs font-medium ${smallAccent}`}>
+          {project.client} · {workKind(project.caseKind)}
         </p>
-      )}
-      <div className="mt-3 flex flex-wrap gap-2 text-[12px] font-bold">
-        <span className={`rounded-full px-3 py-1 ${getDeadlineClass(project)}`}>
-          {getDeadlineLabel(project)}
-        </span>
-        <span className={`rounded-full border ${borderColor} px-3 py-1`}>
+        <span className={`shrink-0 text-xs ${mutedText}`}>
           {project.status}
         </span>
-        <span className={`rounded-full border ${borderColor} px-3 py-1`}>
-          {project.priority}
-        </span>
-        <span className={`rounded-full border ${borderColor} px-3 py-1`}>
-          {project.caseKind}
-        </span>
       </div>
-      <p className={`mt-3 text-[12px] ${mutedText}`}>
-        Diajukan {formatInputDate(project.masukDate)}
-        {project.completedDate
-          ? ` · Selesai ${formatInputDate(project.completedDate)}`
-          : ""}
-      </p>
-      {project.status === "Menunggu" && project.waitingReason && (
-        <p className={`mt-2 break-words text-[12px] ${mutedText}`}>
-          Menunggu: {project.waitingReason}
-        </p>
-      )}
+      <h3 className="mt-2 break-words font-semibold leading-relaxed">
+        {project.title}
+      </h3>
+      <div
+        className={`mt-3 flex items-center justify-between gap-3 text-xs ${mutedText}`}
+      >
+        <span>Masuk {formatInputDate(project.masukDate)}</span>
+        <span className={smallAccent}>Lihat detail →</span>
+      </div>
     </button>
   );
 
   const renderDashboardCase = (project: WorkProject) => (
-    <button type="button" onClick={() => { openMenuPage("project"); selectCase(project); }}
-      className={`group w-full rounded-2xl border ${borderColor} p-4 text-left transition-colors hover:border-emerald-400/60 hover:bg-emerald-400/5 focus-visible:outline-emerald-400`}>
+    <button
+      type="button"
+      onClick={() => {
+        selectCase(project);
+      }}
+      className={`group w-full rounded-2xl border ${borderColor} p-4 text-left transition-colors hover:border-emerald-400/60 hover:bg-emerald-400/5 focus-visible:outline-emerald-400`}
+    >
       <div className="flex items-center justify-between gap-3">
-        <p className={`truncate text-[11px] font-semibold ${smallAccent}`}>{getCaseContext(project)}</p>
-        <span className={`shrink-0 text-[11px] ${mutedText}`}>{project.status}</span>
+        <p className={`truncate text-[11px] font-semibold ${smallAccent}`}>
+          {getCaseContext(project)}
+        </p>
+        <span className={`shrink-0 text-[11px] ${mutedText}`}>
+          {project.status}
+        </span>
       </div>
-      <h3 className="mt-2 break-words text-[14px] font-semibold">{project.title}</h3>
-      <div className={`mt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] ${mutedText}`}>
+      <h3 className="mt-2 break-words text-[14px] font-semibold">
+        {project.title}
+      </h3>
+      <div
+        className={`mt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] ${mutedText}`}
+      >
         <span>{project.requesterPic || "Belum ada PIC"}</span>
-        <span>{project.deadlineDate ? `Deadline ${formatInputDate(project.deadlineDate)}` : "Tanpa deadline"} <span aria-hidden="true">↗</span></span>
+        <span>
+          {project.deadlineDate
+            ? `Deadline ${formatInputDate(project.deadlineDate)}`
+            : "Tanpa deadline"}{" "}
+          <span aria-hidden="true">↗</span>
+        </span>
       </div>
     </button>
   );
@@ -3152,23 +3730,38 @@ export default function Home() {
     );
 
   return (
-    <main className={`min-h-screen text-[13px] leading-[1.5] lg:pl-60 ${pageBg}`}>
+    <main
+      className={`min-h-screen text-[13px] leading-[1.5] lg:pl-60 ${pageBg}`}
+    >
       <section className="mx-auto max-w-[1440px] px-4 py-5 sm:px-8 sm:py-8">
-        <header className="mb-7">
+        <header className={activeMenu === "project" ? "mb-5" : "mb-7"}>
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0">
-              <button type="button" aria-label="Buka navigasi" aria-expanded={isNavigationMenuOpen} onClick={() => setIsNavigationMenuOpen(true)} className={`mb-3 lg:hidden ${secondaryButton}`}>☰ Menu</button>
+              <button
+                type="button"
+                aria-label="Buka navigasi"
+                aria-expanded={isNavigationMenuOpen}
+                onClick={() => setIsNavigationMenuOpen(true)}
+                className={`mb-3 lg:hidden ${secondaryButton}`}
+              >
+                ☰ Menu
+              </button>
               <p
                 className={`text-[12px] font-bold uppercase tracking-wide ${smallAccent}`}
               >
-                Office Nowmy · Ruang Kerja
+                Kerja Nowmy · Ruang Kerja
               </p>
-              <h1 className="mt-2 break-words text-[26px] font-semibold tracking-tight">
-                Hai, {username} 👋
-              </h1>
-              <p className={`mt-1 text-[13px] ${mutedText}`}>
-                Yuk, selesaikan satu per satu. Semua pekerjaanmu ada di sini.
-              </p>
+              {activeMenu !== "project" && (
+                <>
+                  <h1 className="mt-2 break-words text-[26px] font-semibold tracking-tight">
+                    Hai, {username} 👋
+                  </h1>
+                  <p className={`mt-1 text-[13px] ${mutedText}`}>
+                    Yuk, selesaikan satu per satu. Semua pekerjaanmu ada di
+                    sini.
+                  </p>
+                </>
+              )}
             </div>
             <div className="flex flex-wrap gap-2">
               <button
@@ -3176,7 +3769,7 @@ export default function Home() {
                 onClick={() => openNewCase()}
                 className={buttonClass}
               >
-                ＋ Kasus
+                ＋ Pekerjaan
               </button>
               <button
                 type="button"
@@ -3207,26 +3800,64 @@ export default function Home() {
           <div className="space-y-5">
             <div className="flex flex-wrap items-end justify-between gap-3">
               <div>
-                <p className={`text-[11px] font-semibold uppercase tracking-[0.18em] ${smallAccent}`}>Overview</p>
-                <h2 className="mt-1 text-[20px] font-semibold tracking-tight">Fokus pekerjaanmu</h2>
+                <p
+                  className={`text-[11px] font-semibold uppercase tracking-[0.18em] ${smallAccent}`}
+                >
+                  Overview
+                </p>
+                <h2 className="mt-1 text-[20px] font-semibold tracking-tight">
+                  Fokus pekerjaanmu
+                </h2>
               </div>
-              <span className={`text-[12px] ${mutedText}`}>{formatInputDate(getTodayInputDate())}</span>
+              <span className={`text-[12px] ${mutedText}`}>
+                {formatInputDate(getTodayInputDate())}
+              </span>
             </div>
             <div className="grid grid-cols-2 gap-3 xl:grid-cols-3">
               {stats.map(([label, value], index) => (
-                <div key={label} className={`relative overflow-hidden rounded-2xl border ${borderColor} ${index === 0 ? "bg-emerald-400/10" : cardBg} p-4 sm:p-5`}>
+                <div
+                  key={label}
+                  className={`relative overflow-hidden rounded-2xl border ${borderColor} ${index === 0 ? "bg-emerald-400/10" : cardBg} p-4 sm:p-5`}
+                >
                   <div className="flex items-center justify-between gap-2">
-                    <p className={`text-[12px] font-medium ${mutedText}`}>{label}</p>
-                    <span aria-hidden="true" className={`flex h-8 w-8 items-center justify-center rounded-xl ${index === 2 ? "bg-rose-400/10 text-rose-400" : "bg-emerald-400/10 text-emerald-500"}`}>{["◈", "◷", "!", "⋯", "✓", "☑"][index]}</span>
+                    <p className={`text-[12px] font-medium ${mutedText}`}>
+                      {label}
+                    </p>
+                    <span
+                      aria-hidden="true"
+                      className={`flex h-8 w-8 items-center justify-center rounded-xl ${index === 2 ? "bg-rose-400/10 text-rose-400" : "bg-emerald-400/10 text-emerald-500"}`}
+                    >
+                      {["◈", "◷", "!", "⋯", "✓", "☑"][index]}
+                    </span>
                   </div>
-                  <p className="mt-3 text-[30px] font-semibold leading-none tracking-tight">{value}</p>
+                  <p className="mt-3 text-[30px] font-semibold leading-none tracking-tight">
+                    {value}
+                  </p>
                 </div>
               ))}
             </div>
             <details className={`${panelClass} group`}>
               <summary className="flex cursor-pointer list-none items-center justify-between gap-3 font-medium">
-                <span>⌕ Cari & filter pekerjaan <span className={`ml-2 text-[11px] ${mutedText}`}>{[search, filterClient, filterModule, filterStatus, filterPriority].filter(Boolean).length > 0 ? "· Filter aktif" : "· Semua pekerjaan"}</span></span>
-                <span aria-hidden="true" className="transition-transform group-open:rotate-180">⌄</span>
+                <span>
+                  ⌕ Cari &amp; filter pekerjaan{" "}
+                  <span className={`ml-2 text-[11px] ${mutedText}`}>
+                    {[
+                      search,
+                      filterClient,
+                      filterModule,
+                      filterStatus,
+                      filterPriority,
+                    ].filter(Boolean).length > 0
+                      ? "· Filter aktif"
+                      : "· Semua pekerjaan"}
+                  </span>
+                </span>
+                <span
+                  aria-hidden="true"
+                  className="transition-transform group-open:rotate-180"
+                >
+                  ⌄
+                </span>
               </summary>
               <div className="mt-4">{renderFilters()}</div>
             </details>
@@ -3288,594 +3919,1037 @@ export default function Home() {
 
         {activeMenu === "client" && (
           <section className={panelClass}>
-            <div className="mb-5 flex items-center justify-between gap-3"><div><p className={`text-[11px] ${smallAccent}`}>MASTER</p><h2 className="text-[20px] font-semibold">Daftar Client</h2></div><button type="button" className={buttonClass} onClick={() => { setClientError(""); openMenuPage("clientAdd"); }}>＋ Tambah client</button></div>
-            <input aria-label="Cari client" placeholder="Cari nama client..." value={clientHubSearch} onChange={e => setClientHubSearch(e.target.value)} className={inputClass} />
-            {clientError && <p role="alert" className="mt-3 text-rose-500">{clientError}</p>}
+            <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className={`text-[11px] ${smallAccent}`}>MASTER</p>
+                <h2 className="text-[20px] font-semibold">Master Project</h2>
+                <p className={`mt-1 ${mutedText}`}>
+                  Siapkan project dan modul sebelum mencatat pekerjaan.
+                </p>
+              </div>
+              <button
+                type="button"
+                className={buttonClass}
+                onClick={() => {
+                  setClientError("");
+                  openMenuPage("clientAdd");
+                }}
+              >
+                ＋ Tambah project
+              </button>
+            </div>
+            <input
+              aria-label="Cari project"
+              placeholder="Cari nama project..."
+              value={clientHubSearch}
+              onChange={(e) => setClientHubSearch(e.target.value)}
+              className={inputClass}
+            />
+            {clientError && (
+              <p role="alert" className="mt-3 text-rose-500">
+                {clientError}
+              </p>
+            )}
             <div className="mt-4 divide-y divide-neutral-500/15">
-              {clientOptions.filter(name => name.toLowerCase().includes(clientHubSearch.toLowerCase())).map(name => (
-                <div key={name} className="flex items-center justify-between gap-3 py-4"><div><p className="font-semibold">{name}</p><p className={`text-[12px] ${mutedText}`}>{projects.filter(item => item.client.toLowerCase() === name.toLowerCase()).length} masalah tercatat</p></div><button type="button" className={secondaryButton} onClick={() => { setTransactionClient(name); openMenuPage("projects"); }}>Lihat project ↗</button></div>
-              ))}
-              {!clientOptions.some(name => name.toLowerCase().includes(clientHubSearch.toLowerCase())) && <p className={`py-6 ${mutedText}`}>Client tidak ditemukan.</p>}
+              {clientOptions
+                .filter((name) =>
+                  name.toLowerCase().includes(clientHubSearch.toLowerCase()),
+                )
+                .map((name) => (
+                  <div
+                    key={name}
+                    className="flex flex-wrap items-center justify-between gap-3 py-4"
+                  >
+                    <div>
+                      <p className="font-semibold">{name}</p>
+                      <p className={`mt-1 text-[12px] ${mutedText}`}>
+                        {modulesFor(name).join(" · ")}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        className={secondaryButton}
+                        onClick={() => {
+                          setMasterProjectName(name);
+                          setModuleDraft(modulesFor(name));
+                          setClientError("");
+                          openMenuPage("masterModules");
+                        }}
+                      >
+                        Kelola modul
+                      </button>
+                      <button
+                        type="button"
+                        className={buttonClass}
+                        onClick={() => {
+                          setTransactionClient(name);
+                          setTransactionModule("");
+                          setIssueRows([newIssueDraft()]);
+                          setGridError("");
+                          setGridNotice("");
+                          openMenuPage("projects");
+                        }}
+                      >
+                        Catat kerja →
+                      </button>
+                    </div>
+                  </div>
+                ))}
             </div>
           </section>
         )}
         {activeMenu === "clientAdd" && (
-          <section className={`mx-auto max-w-xl ${panelClass}`}><h2 className="text-[20px] font-semibold">Tambah Client</h2>
-            <form onSubmit={saveMasterClient} className="mt-5 space-y-4"><label className="block">Nama client<input autoFocus required maxLength={150} className={`mt-2 ${inputClass}`} value={newClientName} onChange={e => setNewClientName(e.target.value)} /></label>
-              {clientError && <p role="alert" className="text-rose-500">{clientError}</p>}
-              <div className="flex gap-2"><button disabled={savingClient} className={buttonClass}>{savingClient ? "Menyimpan..." : "Simpan client"}</button><button type="button" disabled={savingClient} className={secondaryButton} onClick={() => openMenuPage("client")}>Kembali</button></div>
+          <section className={`mx-auto max-w-xl ${panelClass}`}>
+            <h2 className="text-[20px] font-semibold">Tambah Project</h2>
+            <form onSubmit={saveMasterClient} className="mt-5 space-y-4">
+              <label className="block">
+                Nama project
+                <input
+                  autoFocus
+                  required
+                  maxLength={150}
+                  className={`mt-2 ${inputClass}`}
+                  value={newClientName}
+                  onChange={(e) => setNewClientName(e.target.value)}
+                />
+              </label>
+              <p className={mutedText}>
+                Modul awal: Maintenance, Penambahan, Bug, dan Revisi. Sesuaikan
+                melalui Kelola modul.
+              </p>
+              {clientError && (
+                <p role="alert" className="text-rose-500">
+                  {clientError}
+                </p>
+              )}
+              <div className="flex gap-2">
+                <button disabled={savingClient} className={buttonClass}>
+                  {savingClient ? "Menyimpan..." : "Simpan project"}
+                </button>
+                <button
+                  type="button"
+                  disabled={savingClient}
+                  className={secondaryButton}
+                  onClick={() => openMenuPage("client")}
+                >
+                  Kembali
+                </button>
+              </div>
+            </form>
+          </section>
+        )}
+        {activeMenu === "masterModules" && (
+          <section className={`mx-auto max-w-xl ${panelClass}`}>
+            <p className={`text-[11px] ${smallAccent}`}>MASTER MODUL PROJECT</p>
+            <h2 className="mt-2 text-[20px] font-semibold">
+              {masterProjectName}
+            </h2>
+            <form onSubmit={saveModuleMaster} className="mt-5 space-y-4">
+              <fieldset disabled={savingClient} className="space-y-3">
+                <legend className={`mb-3 ${mutedText}`}>
+                  Pilih modul yang digunakan project ini.
+                </legend>
+                {uniqueLabels([
+                  ...workModules,
+                  ...modulesFor(masterProjectName),
+                ]).map((name) => (
+                  <label
+                    key={name}
+                    className={`flex items-center gap-3 rounded-xl border ${borderColor} p-4`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={moduleDraft.includes(name as CaseKind)}
+                      onChange={(e) =>
+                        setModuleDraft((values) =>
+                          e.target.checked
+                            ? [...values, name as CaseKind]
+                            : values.filter((value) => value !== name),
+                        )
+                      }
+                    />
+                    {name}
+                  </label>
+                ))}
+              </fieldset>
+              <p className={`text-[12px] ${mutedText}`}>
+                Modul yang sudah memiliki catatan tetap tersedia untuk menjaga
+                riwayat.
+              </p>
+              {clientError && (
+                <p role="alert" className="text-rose-500">
+                  {clientError}
+                </p>
+              )}
+              <div className="flex gap-2">
+                <button disabled={savingClient} className={buttonClass}>
+                  {savingClient ? "Menyimpan..." : "Simpan modul"}
+                </button>
+                <button
+                  type="button"
+                  disabled={savingClient}
+                  className={secondaryButton}
+                  onClick={() => openMenuPage("client")}
+                >
+                  Kembali
+                </button>
+              </div>
             </form>
           </section>
         )}
         {activeMenu === "projects" && (
           <div className="space-y-5">
             <section className={panelClass}>
-              <p className={`text-[11px] ${smallAccent}`}>TRANSAKSI</p><h2 className="text-[20px] font-semibold">Daftar Project</h2>
-              <div className="mt-5 grid gap-4 sm:grid-cols-3">
-                <div><span className={`mb-2 block text-[12px] ${mutedText}`}>Client</span><button type="button" disabled={savingGrid} onClick={() => { setClientPickerSearch(""); setClientPickerOpen(true); }} className={`flex w-full items-center justify-between ${secondaryButton}`}>{transactionClient || "Pilih client"}<span aria-hidden="true">⌕</span></button></div>
-                <label>Kelompok form<select disabled={savingGrid} className={`mt-2 ${inputClass}`} value={formGroup} onChange={e => setFormGroup(e.target.value as FormGroup)}>{formGroups.map(group => <option key={group}>{group}</option>)}</select></label>
-                <label>Tanggal pengajuan<input disabled={savingGrid} type="date" required max={getTodayInputDate()} value={gridDate} onChange={e => setGridDate(e.target.value)} className={`mt-2 ${inputClass}`} /></label>
+              <p className={`text-[11px] ${smallAccent}`}>PENCATATAN KERJA</p>
+              <h2 className="mt-1 text-[20px] font-semibold">
+                Project → Modul → Detail pekerjaan
+              </h2>
+              <div className="mt-5 grid gap-4 sm:grid-cols-2">
+                <label>
+                  1. Pilih project
+                  <select
+                    disabled={savingGrid}
+                    className={`mt-2 ${inputClass}`}
+                    value={transactionClient}
+                    onChange={(e) => {
+                      setTransactionClient(e.target.value);
+                      setTransactionModule("");
+                      setIssueRows([newIssueDraft()]);
+                      setGridError("");
+                      setGridNotice("");
+                    }}
+                  >
+                    <option value="">Pilih project</option>
+                    {clientOptions.map((name) => (
+                      <option key={name}>{name}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  2. Pilih modul project
+                  <select
+                    disabled={!transactionClient || savingGrid}
+                    className={`mt-2 ${inputClass}`}
+                    value={transactionModule}
+                    onChange={(e) => {
+                      setTransactionModule(e.target.value as CaseKind);
+                      setIssueRows([newIssueDraft()]);
+                      setGridError("");
+                      setGridNotice("");
+                    }}
+                  >
+                    <option value="">Pilih modul</option>
+                    {modulesFor(transactionClient).map((name) => (
+                      <option key={name}>{name}</option>
+                    ))}
+                  </select>
+                </label>
               </div>
+              <button
+                type="button"
+                className={`mt-3 text-[12px] ${smallAccent}`}
+                onClick={() => openMenuPage("client")}
+              >
+                Kelola master project dan modul ↗
+              </button>
             </section>
-            {!transactionClient ? <div className={`${panelClass} py-12 text-center`}><h3 className="text-[16px] font-semibold">Mulai dari client dulu</h3><p className={`mt-2 ${mutedText}`}>Pilih client untuk melihat project dan menambahkan daftar masalah.</p></div> : <>
-              <section className={panelClass}>
-                <h3 className="text-[16px] font-semibold">Tambah daftar masalah · {transactionClient}</h3><p className={`mt-1 ${mutedText}`}>Satu baris untuk satu masalah atau permintaan. Client berlaku untuk semua baris.</p>
-                <form onSubmit={saveIssueGrid} className="mt-4 space-y-4">
-                  <fieldset disabled={savingGrid} className="min-w-0"><div className="overflow-x-auto rounded-xl border border-neutral-500/20"><table className="w-full min-w-[1100px] text-left text-[12px]"><thead className={softCardBg}><tr>{["No", "Masalah / permintaan *", "Jenis", "Modul / topik *", "PIC *", "Blade / Form", "Deadline", "Prioritas", "Aksi"].map(label => <th key={label} className="p-3 font-medium">{label}</th>)}</tr></thead><tbody>
-                    {issueRows.map((row, index) => <tr key={row.id} className="border-t border-neutral-500/15"><td className="p-2">{index + 1}</td>
-                      <td className="min-w-[240px] p-2"><input aria-label={`Masalah baris ${index+1}`} required className={inputClass} value={row.title} onChange={e => updateIssueRow(row.id, {title:e.target.value})} placeholder="Tuliskan masalah atau kebutuhan" /></td>
-                      <td className="p-2"><select aria-label={`Jenis baris ${index+1}`} className={inputClass} value={row.caseKind} onChange={e => updateIssueRow(row.id, {caseKind:e.target.value as CaseKind})}>{caseKinds.map(kind => <option key={kind}>{kind}</option>)}</select></td>
-                      <td className="min-w-[160px] p-2"><input aria-label={`Modul baris ${index+1}`} required className={inputClass} value={row.module} onChange={e => updateIssueRow(row.id, {module:e.target.value})} placeholder="Contoh: Kasbank" /></td>
-                      <td className="min-w-[140px] p-2"><input aria-label={`PIC baris ${index+1}`} required className={inputClass} value={row.requesterPic} onChange={e => updateIssueRow(row.id, {requesterPic:e.target.value})} /></td>
-                      <td className="min-w-[160px] p-2"><input aria-label={`Blade baris ${index+1}`} className={inputClass} value={row.bladeForm} onChange={e => updateIssueRow(row.id, {bladeForm:e.target.value})} /></td>
-                      <td className="p-2"><input aria-label={`Deadline baris ${index+1}`} type="date" className={inputClass} value={row.deadlineDate} onChange={e => updateIssueRow(row.id, {deadlineDate:e.target.value})} /></td>
-                      <td className="p-2"><select aria-label={`Prioritas baris ${index+1}`} className={inputClass} value={row.priority} onChange={e => updateIssueRow(row.id, {priority:e.target.value as ProjectPriority})}>{priorityOptions.map(value => <option key={value}>{value}</option>)}</select></td>
-                      <td className="p-2"><button type="button" disabled={issueRows.length === 1} aria-label={`Hapus baris ${index+1}`} className={secondaryButton} onClick={() => setIssueRows(rows => rows.filter(item => item.id !== row.id))}>×</button></td>
-                    </tr>)}
-                  </tbody></table></div></fieldset>
-                  {gridError && <p role="alert" className="text-rose-500">{gridError}</p>}{gridNotice && <p role="status" className={smallAccent}>{gridNotice}</p>}
-                  <div className="flex flex-wrap justify-between gap-3"><button type="button" disabled={savingGrid || issueRows.length >= 100} className={secondaryButton} onClick={() => setIssueRows(rows => [...rows, newIssueDraft()])}>＋ Tambah baris</button><button disabled={savingGrid} className={buttonClass}>{savingGrid ? "Menyimpan..." : `Simpan ${issueRows.length} masalah`}</button></div>
-                </form>
+            {!transactionClient || !transactionModule ? (
+              <section className={`${panelClass} py-12 text-center`}>
+                <h3 className="font-semibold">
+                  Pilih project dan modul terlebih dahulu
+                </h3>
+                <p className={`mt-2 ${mutedText}`}>
+                  Detail pekerjaan akan muncul setelah kedua pilihan terisi.
+                </p>
               </section>
-              <section className={panelClass}><h3 className="mb-4 text-[16px] font-semibold">Masalah tersimpan · {formGroup}</h3><div className="overflow-x-auto"><table className="w-full min-w-[650px] text-left"><thead><tr>{["Masalah", "Modul", "Jenis", "Status", ""].map((label,i) => <th key={i} className="p-3 text-[12px] font-medium">{label}</th>)}</tr></thead><tbody>
-                {projects.filter(item => item.client.toLowerCase() === transactionClient.toLowerCase() && (item.formGroup || "Transaksi") === formGroup).map(item => <tr key={item.id} className="border-t border-neutral-500/15"><td className="p-3">{item.title}</td><td className="p-3">{item.module || "—"}</td><td className="p-3">{item.caseKind}</td><td className="p-3">{item.status}</td><td className="p-3"><button type="button" className={secondaryButton} onClick={() => { openMenuPage("project"); selectCase(item); }}>Detail ↗</button></td></tr>)}
-              </tbody></table></div>{!projects.some(item => item.client.toLowerCase() === transactionClient.toLowerCase() && (item.formGroup || "Transaksi") === formGroup) && <p className={`p-4 ${mutedText}`}>Belum ada masalah di kelompok form ini.</p>}<p className={`mt-3 text-[11px] ${mutedText}`}>Data lama tanpa kelompok form ditampilkan di Transaksi.</p></section>
-            </>}
+            ) : (
+              <>
+                <section className={panelClass}>
+                  <h3 className="text-[16px] font-semibold">
+                    3. Detail pekerjaan · {transactionClient} /{" "}
+                    {transactionModule}
+                  </h3>
+                  <p className={`mt-2 text-[12px] ${mutedText}`}>
+                    Satu baris untuk satu pekerjaan. Tanggal selesai otomatis
+                    terisi saat disimpan dengan status Selesai.
+                  </p>
+                  <form onSubmit={saveIssueGrid} className="mt-4 space-y-4">
+                    <fieldset disabled={savingGrid} className="min-w-0">
+                      <div className="overflow-x-auto rounded-xl border border-neutral-500/20">
+                        <table className="w-full min-w-[760px] text-left text-[12px]">
+                          <thead className={softCardBg}>
+                            <tr>
+                              {[
+                                "No",
+                                "Deskripsi *",
+                                "Tanggal masuk *",
+                                "Status *",
+                                "Tanggal selesai",
+                                "Aksi",
+                              ].map((label) => (
+                                <th key={label} className="p-3 font-medium">
+                                  {label}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {issueRows.map((row, index) => (
+                              <tr
+                                key={row.id}
+                                className="border-t border-neutral-500/15"
+                              >
+                                <td className="p-2">{index + 1}</td>
+                                <td className="min-w-[260px] p-2">
+                                  <textarea
+                                    aria-label={`Deskripsi baris ${index + 1}`}
+                                    required
+                                    className={`${inputClass} min-h-20`}
+                                    value={row.title}
+                                    onChange={(e) =>
+                                      updateIssueRow(row.id, {
+                                        title: e.target.value,
+                                      })
+                                    }
+                                    placeholder="Tuliskan pekerjaan yang perlu dikerjakan"
+                                  />
+                                </td>
+                                <td className="p-2">
+                                  <input
+                                    aria-label={`Tanggal masuk baris ${index + 1}`}
+                                    type="date"
+                                    required
+                                    max={getTodayInputDate()}
+                                    className={inputClass}
+                                    value={row.masukDate}
+                                    onChange={(e) =>
+                                      updateIssueRow(row.id, {
+                                        masukDate: e.target.value,
+                                      })
+                                    }
+                                  />
+                                </td>
+                                <td className="p-2">
+                                  <select
+                                    aria-label={`Status baris ${index + 1}`}
+                                    className={inputClass}
+                                    value={row.status}
+                                    onChange={(e) =>
+                                      updateIssueRow(row.id, {
+                                        status: e.target.value as ProjectStatus,
+                                      })
+                                    }
+                                  >
+                                    {statusOptions.map((name) => (
+                                      <option key={name}>{name}</option>
+                                    ))}
+                                  </select>
+                                </td>
+                                <td className={`p-2 ${mutedText}`}>
+                                  {row.status === "Selesai"
+                                    ? "Otomatis saat simpan"
+                                    : "Belum selesai"}
+                                </td>
+                                <td className="p-2">
+                                  <button
+                                    type="button"
+                                    disabled={issueRows.length === 1}
+                                    aria-label={`Hapus baris ${index + 1}`}
+                                    className={secondaryButton}
+                                    onClick={() =>
+                                      setIssueRows((rows) =>
+                                        rows.filter(
+                                          (item) => item.id !== row.id,
+                                        ),
+                                      )
+                                    }
+                                  >
+                                    ×
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </fieldset>
+                    {gridError && (
+                      <p role="alert" className="text-rose-500">
+                        {gridError}
+                      </p>
+                    )}
+                    {gridNotice && (
+                      <p role="status" className={smallAccent}>
+                        {gridNotice}
+                      </p>
+                    )}
+                    <div className="flex flex-wrap justify-between gap-3">
+                      <button
+                        type="button"
+                        disabled={savingGrid || issueRows.length >= 100}
+                        className={secondaryButton}
+                        onClick={() =>
+                          setIssueRows((rows) => [...rows, newIssueDraft()])
+                        }
+                      >
+                        ＋ Tambah baris
+                      </button>
+                      <button disabled={savingGrid} className={buttonClass}>
+                        {savingGrid
+                          ? "Menyimpan..."
+                          : `Simpan ${issueRows.length} pekerjaan`}
+                      </button>
+                    </div>
+                  </form>
+                </section>
+                <section className={panelClass}>
+                  <h3 className="mb-4 font-semibold">Pekerjaan tersimpan</h3>
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[650px] text-left">
+                      <thead>
+                        <tr>
+                          {[
+                            "Deskripsi",
+                            "Tanggal masuk",
+                            "Status",
+                            "Tanggal selesai",
+                            "",
+                          ].map((label, index) => (
+                            <th
+                              key={index}
+                              className="p-3 text-[12px] font-medium"
+                            >
+                              {label}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {transactionRecords.map((item) => (
+                          <tr
+                            key={item.id}
+                            className="border-t border-neutral-500/15"
+                          >
+                            <td className="whitespace-pre-wrap p-3">
+                              {item.title}
+                            </td>
+                            <td className="p-3">
+                              {formatInputDate(item.masukDate)}
+                            </td>
+                            <td className="p-3">{item.status}</td>
+                            <td className="p-3">
+                              {formatInputDate(item.completedDate)}
+                            </td>
+                            <td className="p-3">
+                              <button
+                                type="button"
+                                className={secondaryButton}
+                                onClick={() => startEditProject(item)}
+                              >
+                                Edit
+                              </button>
+                              <button
+                                type="button"
+                                className={`ml-2 ${secondaryButton}`}
+                                onClick={() => {
+                                  selectCase(item);
+                                }}
+                              >
+                                Detail ↗
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {!transactionRecords.length && (
+                    <p className={mutedText}>
+                      Belum ada pekerjaan pada modul ini.
+                    </p>
+                  )}
+                </section>
+              </>
+            )}
           </div>
         )}
-
         {activeMenu === "tambah" && (
           <section className={`mx-auto max-w-3xl ${panelClass}`}>
-            <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <h2 className="text-[16px] font-semibold">
-                  {editingProjectId
-                    ? "Edit Kasus Maintenance"
-                    : "Tambah Kasus Maintenance"}
-                </h2>
-                <p className={`mt-1 text-[13px] ${mutedText}`}>
-                  Catat satu masalah atau permintaan sebagai satu kasus.
-                </p>
-              </div>
-              {editingProjectId && (
+            <button
+              type="button"
+              disabled={isSaving}
+              onClick={() => {
+                resetForm();
+                goBack();
+              }}
+              className={`mb-4 ${secondaryButton}`}
+            >
+              ← Kembali
+            </button>
+            <h2 className="text-[20px] font-semibold">
+              {editingProjectId ? "Edit pekerjaan" : "Tambah pekerjaan"}
+            </h2>
+            <form onSubmit={saveProject} className="mt-5 space-y-4">
+              <fieldset disabled={isSaving} className="space-y-4">
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <label>
+                    1. Project
+                    <select
+                      required
+                      className={`mt-2 ${inputClass}`}
+                      value={client}
+                      onChange={(e) => {
+                        setClient(e.target.value);
+                        setModule("");
+                        setCaseKind("Bug");
+                      }}
+                    >
+                      <option value="">Pilih project</option>
+                      {clientOptions.map((name) => (
+                        <option key={name}>{name}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    2. Modul project
+                    <select
+                      required
+                      disabled={!client}
+                      className={`mt-2 ${inputClass}`}
+                      value={module ? caseKind : ""}
+                      onChange={(e) => {
+                        setModule(e.target.value);
+                        setCaseKind(e.target.value as CaseKind);
+                      }}
+                    >
+                      <option value="">Pilih modul</option>
+                      {moduleOptions.map((name) => (
+                        <option key={name}>{name}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                {client && module && (
+                  <>
+                    <label className="block">
+                      3. Deskripsi *
+                      <textarea
+                        required
+                        className={`mt-2 min-h-32 ${inputClass}`}
+                        value={title}
+                        onChange={(e) => setTitle(e.target.value)}
+                      />
+                    </label>
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <label>
+                        Tanggal masuk *
+                        <input
+                          required
+                          type="date"
+                          max={getTodayInputDate()}
+                          className={`mt-2 ${inputClass}`}
+                          value={masukDate}
+                          onChange={(e) => setMasukDate(e.target.value)}
+                        />
+                      </label>
+                      <label>
+                        Status
+                        <select
+                          className={`mt-2 ${inputClass}`}
+                          value={status}
+                          onChange={(e) =>
+                            setStatus(e.target.value as ProjectStatus)
+                          }
+                        >
+                          {statusOptions.map((name) => (
+                            <option key={name}>{name}</option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <p className={`text-[12px] ${mutedText}`}>
+                      {status === "Selesai"
+                        ? `Tanggal selesai: ${formatInputDate(
+                            completionOnSave(
+                              status,
+                              projects.find(
+                                (item) => item.id === editingProjectId,
+                              ),
+                            ),
+                          )}. Dicatat otomatis saat simpan.`
+                        : "Tanggal selesai akan terisi otomatis saat pekerjaan disimpan dengan status Selesai."}
+                    </p>
+                    {projectNotes && (
+                      <p
+                        className={`whitespace-pre-wrap text-[12px] ${mutedText}`}
+                      >
+                        Catatan sebelumnya: {projectNotes}
+                      </p>
+                    )}
+                  </>
+                )}
+              </fieldset>
+              <div className="flex gap-2">
+                <button
+                  disabled={isSaving || !client || !module}
+                  className={buttonClass}
+                >
+                  {isSaving ? "Menyimpan..." : "Simpan pekerjaan"}
+                </button>
                 <button
                   type="button"
+                  disabled={isSaving}
                   className={secondaryButton}
                   onClick={() => {
                     resetForm();
-                    openMenuPage("project");
+                    goBack();
                   }}
                 >
-                  Batal edit
+                  Batal
                 </button>
-              )}
-            </div>
-            <form onSubmit={saveProject} className="space-y-4">
-              <div className="space-y-3">
-                <h3
-                  className={`text-[11px] font-semibold uppercase tracking-wide ${mutedText}`}
-                >
-                  Identitas maintenance
-                </h3>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <label className="block min-w-0">
-                    <span
-                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                    >
-                      Client *
-                    </span>
-                    <input
-                      aria-label="Client kasus"
-                      list="office-client-options"
-                      className={inputClass}
-                      value={client}
-                      onChange={(event) => {
-                        setClient(event.target.value);
-                        setModule("");
-                      }}
-                      required
-                      placeholder="Pilih / ketik client baru"
-                      maxLength={100}
-                    />
-                    <datalist id="office-client-options">
-                      {clientOptions.map((name) => (
-                        <option key={name} value={name} />
-                      ))}
-                    </datalist>
-                  </label>
-                  <label className="block min-w-0">
-                    <span
-                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                    >
-                      Modul/Topik *
-                    </span>
-                    <input
-                      aria-label="Modul kasus"
-                      list="office-module-options"
-                      className={inputClass}
-                      value={module}
-                      onChange={(event) => setModule(event.target.value)}
-                      required
-                      disabled={!client.trim()}
-                      placeholder="Contoh: Kasbank, SPB, General Ledger"
-                      maxLength={100}
-                    />
-                    <datalist id="office-module-options">
-                      {moduleOptions.map((name) => (
-                        <option key={name} value={name} />
-                      ))}
-                    </datalist>
-                  </label>
-                </div>
-                <p className={`text-[12px] ${mutedText}`}>
-                  Pilihan modul mengikuti client. Ketik nama baru jika
-                  modul/topiknya belum tersedia.
-                </p>
-                <label className="block">
-                  <span
-                    className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                  >
-                    Judul kasus *
-                  </span>
-                  <input
-                    aria-label="Judul kasus"
-                    className={inputClass}
-                    value={title}
-                    onChange={(event) => setTitle(event.target.value)}
-                    required
-                    placeholder="Contoh: detail bukti pembayaran tidak muncul"
-                    maxLength={200}
-                  />
-                </label>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <label className="block">
-                    <span
-                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                    >
-                      PIC peminta maintenance *
-                    </span>
-                    <input
-                      aria-label="PIC peminta"
-                      className={inputClass}
-                      value={requesterPic}
-                      onChange={(event) => setRequesterPic(event.target.value)}
-                      required
-                      placeholder="Nama orang yang mengajukan"
-                      maxLength={150}
-                    />
-                  </label>
-                  <label className="block">
-                    <span
-                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                    >
-                      Blade/Form <span className="font-normal">(opsional)</span>
-                    </span>
-                    <input
-                      aria-label="Blade/Form"
-                      className={inputClass}
-                      value={bladeForm}
-                      onChange={(event) => setBladeForm(event.target.value)}
-                      placeholder="Contoh: fKasBank.blade.php"
-                      maxLength={500}
-                    />
-                  </label>
-                </div>
               </div>
-              <div className={`space-y-3 border-t ${borderColor} pt-4`}>
-                <h3
-                  className={`text-[11px] font-semibold uppercase tracking-wide ${mutedText}`}
-                >
-                  Jadwal & status
-                </h3>
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <label className="block">
-                    <span
-                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                    >
-                      Tanggal pengajuan *
-                    </span>
-                    <input
-                      aria-label="Tanggal pengajuan"
-                      type="date"
-                      className={inputClass}
-                      value={masukDate}
-                      onChange={(event) => setMasukDate(event.target.value)}
-                      max={getTodayInputDate()}
-                      required
-                    />
-                  </label>
-                  <label className="block">
-                    <span
-                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                    >
-                      Deadline <span className="font-normal">(opsional)</span>
-                    </span>
-                    <input
-                      aria-label="Deadline kasus"
-                      type="date"
-                      className={inputClass}
-                      value={deadlineDate}
-                      onChange={(event) => setDeadlineDate(event.target.value)}
-                    />
-                    {deadlineDate && (
-                      <button
-                        type="button"
-                        className={`mt-1 text-[12px] font-bold ${smallAccent}`}
-                        onClick={() => setDeadlineDate("")}
-                      >
-                        Kosongkan deadline
-                      </button>
-                    )}
-                  </label>
-                </div>
-                <div className="grid gap-3 sm:grid-cols-3">
-                  <label className="block">
-                    <span
-                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                    >
-                      Jenis
-                    </span>
-                    <select
-                      aria-label="Jenis kasus"
-                      className={inputClass}
-                      value={caseKind}
-                      onChange={(event) =>
-                        setCaseKind(event.target.value as CaseKind)
-                      }
-                    >
-                      {caseKinds.map((name) => (
-                        <option key={name}>{name}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="block">
-                    <span
-                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                    >
-                      Status
-                    </span>
-                    <select
-                      aria-label="Status kasus"
-                      className={inputClass}
-                      value={status}
-                      onChange={(event) => {
-                        const next = event.target.value as ProjectStatus;
-                        setStatus(next);
-                        if (next === "Selesai" && !completedDate)
-                          setCompletedDate(getTodayInputDate());
-                      }}
-                    >
-                      {statusOptions.map((name) => (
-                        <option key={name}>{name}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="block">
-                    <span
-                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                    >
-                      Prioritas
-                    </span>
-                    <select
-                      aria-label="Prioritas kasus"
-                      className={inputClass}
-                      value={priority}
-                      onChange={(event) =>
-                        setPriority(event.target.value as ProjectPriority)
-                      }
-                    >
-                      {priorityOptions.map((name) => (
-                        <option key={name}>{name}</option>
-                      ))}
-                    </select>
-                  </label>
-                </div>
-                {status === "Menunggu" && (
-                  <label className="block">
-                    <span
-                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                    >
-                      Sedang menunggu apa? *
-                    </span>
-                    <textarea
-                      aria-label="Keterangan menunggu"
-                      className={`${inputClass} min-h-24`}
-                      value={waitingReason}
-                      onChange={(event) => setWaitingReason(event.target.value)}
-                      required
-                      placeholder="Contoh: menunggu data / konfirmasi dari PIC"
-                    />
-                  </label>
-                )}
-                {status === "Selesai" && (
-                  <label className="block">
-                    <span
-                      className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                    >
-                      Tanggal selesai *
-                    </span>
-                    <input
-                      aria-label="Tanggal selesai di form"
-                      type="date"
-                      className={inputClass}
-                      value={completedDate}
-                      onChange={(event) => setCompletedDate(event.target.value)}
-                      min={masukDate || undefined}
-                      max={getTodayInputDate()}
-                      required
-                    />
-                    <span className={`mt-1 block text-[12px] ${mutedText}`}>
-                      Pilih tanggal pekerjaan benar-benar selesai, walaupun baru
-                      dicatat hari ini.
-                    </span>
-                  </label>
-                )}
-              </div>
-              <div className={`space-y-3 border-t ${borderColor} pt-4`}>
-                <label className="block">
-                  <span
-                    className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                  >
-                    Deskripsi / catatan awal
-                  </span>
-                  <textarea
-                    aria-label="Deskripsi kasus"
-                    className={`${inputClass} min-h-24`}
-                    value={projectNotes}
-                    onChange={(event) => setProjectNotes(event.target.value)}
-                    placeholder="Masalah, kebutuhan, link, atau catatan penting"
-                  />
-                </label>
-              </div>
-              <button disabled={isSaving} className={`w-full ${buttonClass}`}>
-                {isSaving
-                  ? "Menyimpan..."
-                  : editingProjectId
-                    ? "Simpan perubahan"
-                    : "Simpan kasus"}
-              </button>
             </form>
           </section>
         )}
 
         {activeMenu === "project" && (
-          <div className="grid items-start gap-3 lg:grid-cols-[0.95fr_1.05fr]">
-            <section className={panelClass}>
-              <div className="mb-4 flex items-center justify-between gap-2">
-                <div>
-                  <h2 className="text-[16px] font-semibold">
-                    Kasus Maintenance
-                  </h2>
-                  <p className={`mt-1 text-[13px] ${mutedText}`}>
-                    {filteredProjects.length} kasus sesuai filter
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  className={secondaryButton}
-                  disabled={isLoadingProjects}
-                  onClick={fetchProjects}
-                >
-                  Refresh
-                </button>
-              </div>
-              {renderFilters()}
-              <div className="mt-4 space-y-3">
-                {filteredProjects.map((project) =>
-                  renderCaseCard(project, project.id === selectedProjectId),
-                )}
-              </div>
-              {!isLoadingProjects && filteredProjects.length === 0 && (
-                <p className={`mt-4 text-[13px] ${mutedText}`}>
-                  Belum ada kasus sesuai filter.
-                </p>
-              )}
-            </section>
-            <section id="case-detail" className={`${panelClass} scroll-mt-4`}>
-              {!selectedProject ||
-              !filteredProjects.some(
-                (item) => item.id === selectedProject.id,
-              ) ? (
-                <p className={mutedText}>
-                  Pilih kasus dari daftar untuk melihat detail, tugas, dan
-                  progress.
-                </p>
-              ) : (
-                <div className="space-y-3">
+          <div className="mx-auto max-w-4xl space-y-5">
+            <button
+              type="button"
+              onClick={goBack}
+              disabled={savingStatus || isSavingNote || isSavingTask}
+              className={secondaryButton}
+            >
+              ← Kembali
+            </button>
+            {projectView === "list" ? (
+              <section className={panelClass}>
+                <div className="flex items-center justify-between gap-3">
                   <div>
-                    <p
-                      className={`mb-2 break-words text-[12px] font-bold ${smallAccent}`}
-                    >
-                      {getCaseContext(selectedProject)}
+                    <h2 className="text-xl font-semibold">Daftar pekerjaan</h2>
+                    <p className={`mt-1 ${mutedText}`}>
+                      {filteredProjects.length} pekerjaan
                     </p>
-                    <h2 className="break-words text-[16px] font-semibold">
-                      {selectedProject.title}
-                    </h2>
-                    <div className="mt-3 flex flex-wrap gap-2 text-[12px] font-bold">
-                      <span
-                        className={`rounded-full px-3 py-1 ${getDeadlineClass(selectedProject)}`}
-                      >
-                        {getDeadlineLabel(selectedProject)}
-                      </span>
-                      <span
-                        className={`rounded-full border ${borderColor} px-3 py-1`}
-                      >
-                        {selectedProject.status}
-                      </span>
-                      <span
-                        className={`rounded-full border ${borderColor} px-3 py-1`}
-                      >
-                        {selectedProject.priority}
-                      </span>
-                      <span
-                        className={`rounded-full border ${borderColor} px-3 py-1`}
-                      >
-                        {selectedProject.caseKind}
-                      </span>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={isLoadingProjects}
+                    onClick={fetchProjects}
+                    className={secondaryButton}
+                  >
+                    Refresh
+                  </button>
+                </div>
+                <details
+                  className={`mt-4 rounded-xl border ${borderColor} p-3`}
+                >
+                  <summary className="cursor-pointer font-medium">
+                    Cari dan filter
+                  </summary>
+                  <div className="mt-4">{renderFilters()}</div>
+                </details>
+                <div className="mt-4 space-y-3">
+                  {filteredProjects.map((project) => renderCaseCard(project))}
+                </div>
+                {!filteredProjects.length && (
+                  <p className={`py-8 text-center ${mutedText}`}>
+                    Belum ada pekerjaan sesuai filter.
+                  </p>
+                )}
+              </section>
+            ) : !selectedProject ? (
+              <section className={`${panelClass} py-10 text-center`}>
+                <h2 className="text-lg font-semibold">
+                  Pekerjaan tidak tersedia
+                </h2>
+                <p className={`mt-2 ${mutedText}`}>
+                  Kembali ke daftar untuk memilih pekerjaan.
+                </p>
+              </section>
+            ) : (
+              <>
+                <section
+                  id="case-detail"
+                  key={selectedProject.id}
+                  className={`${panelClass} space-y-5 sm:p-6`}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <p className={`font-medium ${smallAccent}`}>
+                      {selectedProject.client || "Tanpa project"}
+                      <span className={`mx-2 ${mutedText}`}>/</span>
+                      {workKind(selectedProject.caseKind)}
+                    </p>
+                    <span
+                      className={`rounded-full px-3 py-1 text-xs font-semibold ${selectedProject.status === "Selesai" ? "bg-emerald-400/15 text-emerald-500" : `${softCardBg} ${mutedText}`}`}
+                    >
+                      {selectedProject.status}
+                    </span>
+                  </div>
+                  <h2 className="whitespace-pre-wrap break-words text-xl font-semibold leading-relaxed sm:text-2xl">
+                    {selectedProject.title}
+                  </h2>
+                  <div
+                    className={`flex flex-wrap gap-x-8 gap-y-3 border-y ${borderColor} py-4`}
+                  >
+                    <div>
+                      <p className={`text-xs ${mutedText}`}>Tanggal masuk</p>
+                      <p className="mt-1 font-medium">
+                        {formatInputDate(selectedProject.masukDate)}
+                      </p>
                     </div>
-                  </div>
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    {[
-                      [
-                        "PIC peminta",
-                        selectedProject.requesterPic || "Belum diisi",
-                      ],
-                      [
-                        "Blade/Form",
-                        selectedProject.bladeForm || "Tidak diisi",
-                      ],
-                      [
-                        "Tanggal pengajuan",
-                        formatInputDate(selectedProject.masukDate),
-                      ],
-                      [
-                        "Tanggal selesai",
-                        selectedProject.completedDate
+                    <div>
+                      <p className={`text-xs ${mutedText}`}>Tanggal selesai</p>
+                      <p className="mt-1 font-medium">
+                        {selectedProject.completedDate
                           ? formatInputDate(selectedProject.completedDate)
-                          : selectedProject.status === "Selesai"
-                            ? "Belum tercatat — pilih tanggal"
-                            : "Belum selesai",
-                      ],
-                      [
-                        "Deadline",
-                        selectedProject.deadlineDate
-                          ? formatInputDate(selectedProject.deadlineDate)
-                          : "Tanpa deadline",
-                      ],
-                      [
-                        "Terakhir diperbarui",
-                        selectedProject.updatedAtMillis
-                          ? new Date(
-                              selectedProject.updatedAtMillis,
-                            ).toLocaleString("id-ID")
-                          : selectedProject.createdAtText,
-                      ],
-                    ].map(([label, value]) => (
-                      <div
-                        key={label}
-                        className={`min-w-0 rounded-2xl ${softCardBg} p-3`}
-                      >
-                        <p className={`text-[12px] font-medium ${mutedText}`}>
-                          {label}
-                        </p>
-                        <p className="mt-1 break-words text-[13px] font-bold">
-                          {value}
-                        </p>
-                      </div>
-                    ))}
-                  </div>
-                  {selectedProject.waitingReason &&
-                    selectedProject.status === "Menunggu" && (
-                      <div className={`rounded-2xl border ${borderColor} p-4`}>
-                        <p
-                          className={`mb-1 text-[12px] font-medium ${mutedText}`}
-                        >
-                          Sedang menunggu
-                        </p>
-                        <p className="whitespace-pre-wrap break-words text-[13px]">
-                          {selectedProject.waitingReason}
+                          : "Belum selesai"}
+                      </p>
+                    </div>
+                    {selectedProject.deadlineDate && (
+                      <div>
+                        <p className={`text-xs ${mutedText}`}>Deadline</p>
+                        <p className="mt-1 font-medium">
+                          {formatInputDate(selectedProject.deadlineDate)}
                         </p>
                       </div>
                     )}
-                  {selectedProject.notes && (
-                    <div className={`rounded-2xl ${softCardBg} p-3`}>
-                      <p
-                        className={`mb-2 text-[12px] font-medium ${mutedText}`}
+                  </div>
+                  <div className="flex flex-wrap items-end gap-3">
+                    <label className="w-full sm:w-48">
+                      <span className={`mb-1 block text-xs ${mutedText}`}>
+                        Ubah status
+                      </span>
+                      <select
+                        aria-label="Ubah status pekerjaan"
+                        value={selectedProject.status}
+                        disabled={savingStatus}
+                        className={inputClass}
+                        onChange={(event) =>
+                          void changeWorkStatus(
+                            selectedProject,
+                            event.target.value as ProjectStatus,
+                          )
+                        }
                       >
-                        Deskripsi / catatan awal
+                        {statusOptions.map((name) => (
+                          <option key={name}>{name}</option>
+                        ))}
+                      </select>
+                    </label>
+                    {selectedProject.status !== "Selesai" && (
+                      <button
+                        type="button"
+                        disabled={savingStatus}
+                        onClick={() =>
+                          void changeWorkStatus(selectedProject, "Selesai")
+                        }
+                        className={buttonClass}
+                      >
+                        {savingStatus ? "Menyimpan..." : "✓ Selesaikan"}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      disabled={savingStatus}
+                      onClick={() => startEditProject(selectedProject)}
+                      className={secondaryButton}
+                    >
+                      Edit pekerjaan
+                    </button>
+                  </div>
+                  {savingStatus && (
+                    <p role="status" className={mutedText}>
+                      Menyimpan status...
+                    </p>
+                  )}
+                  {detailNotice && (
+                    <p role="status" className={smallAccent}>
+                      {detailNotice}
+                    </p>
+                  )}
+                  {detailError && (
+                    <p role="alert" className="text-rose-500">
+                      {detailError}
+                    </p>
+                  )}
+                  {selectedProject.waitingReason &&
+                    selectedProject.status === "Menunggu" && (
+                      <p className={`whitespace-pre-wrap ${mutedText}`}>
+                        Menunggu: {selectedProject.waitingReason}
                       </p>
-                      <p className="whitespace-pre-wrap break-words text-[13px] leading-5">
+                    )}
+                  {selectedProject.notes && (
+                    <div>
+                      <h3 className={`mb-2 text-xs ${mutedText}`}>
+                        Catatan awal
+                      </h3>
+                      <p className="whitespace-pre-wrap break-words leading-relaxed">
                         {selectedProject.notes}
                       </p>
                     </div>
                   )}
-                  <div className="flex flex-wrap gap-2">
+                  <details className={`border-t ${borderColor} pt-4`}>
+                    <summary className={`cursor-pointer text-xs ${mutedText}`}>
+                      Informasi tambahan dan opsi lainnya
+                    </summary>
+                    <dl className="mt-4 space-y-3 text-xs">
+                      {[
+                        [
+                          "Modul/topik sebelumnya",
+                          selectedProject.module !==
+                          workKind(selectedProject.caseKind)
+                            ? selectedProject.module
+                            : "",
+                        ],
+                        ["PIC", selectedProject.requesterPic],
+                        ["Blade/Form", selectedProject.bladeForm],
+                        [
+                          "Prioritas",
+                          selectedProject.priority !== "Normal"
+                            ? selectedProject.priority
+                            : "",
+                        ],
+                        [
+                          "Terakhir diperbarui",
+                          selectedProject.updatedAtMillis
+                            ? new Date(
+                                selectedProject.updatedAtMillis,
+                              ).toLocaleString("id-ID")
+                            : selectedProject.createdAtText,
+                        ],
+                      ]
+                        .filter(([, value]) => Boolean(value))
+                        .map(([label, value]) => (
+                          <div key={label}>
+                            <dt className={mutedText}>{label}</dt>
+                            <dd className="mt-1 break-words">{value}</dd>
+                          </div>
+                        ))}
+                    </dl>
                     <button
                       type="button"
-                      onClick={() => openCompletion(selectedProject)}
-                      className={buttonClass}
-                    >
-                      {selectedProject.status === "Selesai"
-                        ? "Ubah tanggal selesai"
-                        : "✓ Beres"}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        startEditProject(selectedProject);
-                        window.scrollTo({ top: 0, behavior: "smooth" });
-                      }}
-                      className={secondaryButton}
-                    >
-                      Edit kasus
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setSelectedHistoryProjectId(selectedProject.id);
-                        openMenuPage("riwayat");
-                      }}
-                      className={secondaryButton}
-                    >
-                      Riwayat
-                    </button>
-                    <button
-                      type="button"
+                      disabled={savingStatus || isSavingNote || isSavingTask}
                       onClick={() => deleteProject(selectedProject)}
-                      className="rounded-xl bg-red-100 px-3 py-2 text-[13px] font-semibold text-red-700"
+                      className="mt-5 rounded-lg border border-rose-500/30 px-3 py-2 text-xs text-rose-500"
                     >
-                      Hapus
+                      Hapus pekerjaan
                     </button>
+                  </details>
+                </section>
+                <section className={panelClass}>
+                  <div
+                    role="tablist"
+                    aria-label="Aktivitas pekerjaan"
+                    className={`flex gap-1 overflow-x-auto border-b ${borderColor}`}
+                  >
+                    {(
+                      [
+                        ["notes", "Catatan", selectedProjectNotes.length],
+                        [
+                          "tasks",
+                          "Tugas",
+                          tasks.filter(
+                            (item) => item.projectId === selectedProject.id,
+                          ).length,
+                        ],
+                        [
+                          "history",
+                          "Riwayat",
+                          activityRows.filter(
+                            (item) => item.projectId === selectedProject.id,
+                          ).length,
+                        ],
+                      ] as const
+                    ).map(([id, label, count]) => (
+                      <button
+                        key={id}
+                        id={`detail-tab-${id}`}
+                        type="button"
+                        role="tab"
+                        aria-selected={detailTab === id}
+                        aria-controls={`detail-panel-${id}`}
+                        onClick={() => {
+                          setDetailTab(id);
+                          if (id === "tasks")
+                            setTaskProjectId(selectedProject.id);
+                        }}
+                        className={`shrink-0 border-b-2 px-4 py-3 font-medium ${detailTab === id ? `border-emerald-400 ${smallAccent}` : `border-transparent ${mutedText}`}`}
+                      >
+                        {label}
+                        <span className={`ml-2 text-xs ${mutedText}`}>
+                          {count}
+                        </span>
+                      </button>
+                    ))}
                   </div>
-                  <div>
-                    <h3 className="mb-3 font-semibold">Tugas kasus ini</h3>
-                    <div className="space-y-2">
+                  {detailTab === "notes" && (
+                    <div
+                      id="detail-panel-notes"
+                      role="tabpanel"
+                      aria-labelledby="detail-tab-notes"
+                      className="pt-5"
+                    >
+                      <details
+                        key={`note-${selectedProject.id}`}
+                        className={`mb-5 rounded-xl border ${borderColor} p-4`}
+                      >
+                        <summary
+                          className={`cursor-pointer font-medium ${smallAccent}`}
+                        >
+                          ＋ Tambah catatan
+                        </summary>
+                        <form onSubmit={saveNote} className="mt-4 space-y-3">
+                          <label className="block">
+                            <span className={`mb-1 block text-xs ${mutedText}`}>
+                              Tanggal catatan
+                            </span>
+                            <input
+                              required
+                              type="date"
+                              disabled={isSavingNote}
+                              value={noteDate}
+                              onChange={(e) => setNoteDate(e.target.value)}
+                              className={`sm:max-w-52 ${inputClass}`}
+                            />
+                          </label>
+                          <textarea
+                            aria-label="Catatan progress"
+                            required={!noteImageDraft.images.length}
+                            disabled={isSavingNote}
+                            value={noteText}
+                            onChange={(e) => setNoteText(e.target.value)}
+                            className={`${inputClass} min-h-24`}
+                            placeholder="Tulis perkembangan atau hasil pekerjaan..."
+                          />
+                          {noteImageDraft.error && (
+                            <p role="alert" className="text-rose-500">
+                              {noteImageDraft.error}
+                            </p>
+                          )}
+                          <button
+                            disabled={isSavingNote}
+                            className={buttonClass}
+                          >
+                            {isSavingNote ? "Menyimpan..." : "Simpan catatan"}
+                          </button>
+                        </form>
+                      </details>
+                      <div className="space-y-4">
+                        {selectedProjectNotes.map((note) => (
+                          <article
+                            key={note.id}
+                            className={`border-b ${borderColor} pb-4 last:border-0`}
+                          >
+                            <div className="mb-2 flex items-center justify-between gap-3">
+                              <p className={`text-xs ${mutedText}`}>
+                                {formatInputDate(note.noteDate)}
+                              </p>
+                              <button
+                                type="button"
+                                onClick={() => deleteNote(note.id)}
+                                className="text-xs text-rose-500"
+                              >
+                                Hapus
+                              </button>
+                            </div>
+                            <p className="whitespace-pre-wrap break-words leading-relaxed">
+                              {note.note}
+                            </p>
+                            <NoteImageGallery
+                              images={note.attachments}
+                              onOpen={openNoteImages}
+                            />
+                          </article>
+                        ))}
+                      </div>
+                      {!selectedProjectNotes.length && (
+                        <p className={`py-5 text-center ${mutedText}`}>
+                          Belum ada catatan untuk pekerjaan ini.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  {detailTab === "tasks" && (
+                    <div
+                      id="detail-panel-tasks"
+                      role="tabpanel"
+                      aria-labelledby="detail-tab-tasks"
+                      className="space-y-4 pt-5"
+                    >
+                      {selectedProject.status !== "Selesai" && (
+                        <form
+                          onSubmit={saveTask}
+                          className={`space-y-3 rounded-xl border ${borderColor} p-4`}
+                        >
+                          <label className="block">
+                            <span className={`mb-1 block text-xs ${mutedText}`}>
+                              Tambah tugas
+                            </span>
+                            <input
+                              required
+                              aria-label="Tugas baru"
+                              disabled={isSavingTask}
+                              value={taskTitle}
+                              onChange={(e) => setTaskTitle(e.target.value)}
+                              className={inputClass}
+                              placeholder="Apa yang perlu dikerjakan?"
+                            />
+                          </label>
+                          <div className="flex flex-wrap items-end gap-3">
+                            <label>
+                              <span
+                                className={`mb-1 block text-xs ${mutedText}`}
+                              >
+                                Tanggal target
+                              </span>
+                              <input
+                                type="date"
+                                required
+                                disabled={isSavingTask}
+                                value={taskDate}
+                                onChange={(e) => setTaskDate(e.target.value)}
+                                className={inputClass}
+                              />
+                            </label>
+                            <button
+                              disabled={isSavingTask}
+                              className={buttonClass}
+                            >
+                              {isSavingTask ? "Menyimpan..." : "Tambah tugas"}
+                            </button>
+                          </div>
+                          {taskImageDraft.error && (
+                            <p role="alert" className="text-rose-500">
+                              {taskImageDraft.error}
+                            </p>
+                          )}
+                        </form>
+                      )}
                       {tasks
                         .filter((item) => item.projectId === selectedProject.id)
                         .map((task) => (
                           <div
                             key={task.id}
-                            className={`flex items-start gap-3 rounded-2xl ${softCardBg} p-3`}
+                            className={`flex items-start gap-3 border-b ${borderColor} pb-4 last:border-0`}
                           >
                             <button
                               type="button"
+                              role="checkbox"
+                              aria-checked={task.isDone}
+                              aria-label={`${task.isDone ? "Buka kembali" : "Selesaikan"} tugas: ${task.title}`}
                               onClick={() => toggleTaskDone(task)}
-                              aria-label={
-                                task.isDone
-                                  ? "Batalkan selesai tugas"
-                                  : "Selesaikan tugas"
-                              }
-                              className={`shrink-0 rounded-xl border ${borderColor} px-3 py-2 ${smallAccent}`}
+                              className={`h-7 w-7 shrink-0 rounded-lg border ${borderColor} ${task.isDone ? "bg-emerald-400/15 text-emerald-500" : ""}`}
                             >
-                              {task.isDone ? "✓" : "○"}
+                              {task.isDone ? "✓" : ""}
                             </button>
-                            <div className="min-w-0 flex-1">
+                            <div className="min-w-0">
                               <p
-                                className={`whitespace-pre-wrap break-words text-[13px] ${task.isDone ? "line-through" : ""}`}
+                                className={`whitespace-pre-wrap break-words ${task.isDone ? `line-through ${mutedText}` : ""}`}
                               >
                                 {task.title}
                               </p>
-                              <p className={`mt-1 text-[12px] ${mutedText}`}>
+                              <p className={`mt-1 text-xs ${mutedText}`}>
                                 Target {formatInputDate(task.taskDate)}
                               </p>
                               <NoteImageGallery
@@ -3885,107 +4959,58 @@ export default function Home() {
                             </div>
                           </div>
                         ))}
+                      {!tasks.some(
+                        (item) => item.projectId === selectedProject.id,
+                      ) && (
+                        <p className={`py-5 text-center ${mutedText}`}>
+                          Belum ada tugas untuk pekerjaan ini.
+                        </p>
+                      )}
                     </div>
-                    {!tasks.some(
-                      (item) => item.projectId === selectedProject.id,
-                    ) && (
-                      <p className={`text-[13px] ${mutedText}`}>
-                        Belum ada tugas.
-                      </p>
-                    )}
-                    {selectedProject.status !== "Selesai" && (
-                      <button
-                        type="button"
-                        className={`mt-3 text-[13px] font-bold ${smallAccent}`}
-                        onClick={() => {
-                          setTaskProjectId(selectedProject.id);
-                          openMenuPage("tugas");
-                        }}
-                      >
-                        ＋ Tambah tugas
-                      </button>
-                    )}
-                  </div>
-                  <form
-                    onSubmit={saveNote}
-                    className={`rounded-2xl border ${borderColor} ${softCardBg} p-4`}
-                  >
-                    <h3 className="mb-3 font-semibold">
-                      Tambah catatan progress
-                    </h3>
-                    <label className="block">
-                      <span className={`mb-1 block text-[12px] ${mutedText}`}>
-                        Tanggal catatan
-                      </span>
-                      <input
-                        type="date"
-                        className={inputClass}
-                        value={noteDate}
-                        disabled={isSavingNote}
-                        onChange={(event) => setNoteDate(event.target.value)}
-                        required
-                      />
-                    </label>
-                    <textarea
-                      aria-label="Catatan progress"
-                      className={`mt-3 ${inputClass} min-h-24`}
-                      value={noteText}
-                      onChange={(event) => setNoteText(event.target.value)}
-                      disabled={isSavingNote}
-                      required={noteImageDraft.images.length === 0}
-                      placeholder="Progress, hasil follow up, link, atau revisi..."
-                    />
-                    {noteImageDraft.error && (
-                      <p role="alert" className="mt-2 text-[12px] text-red-500">
-                        {noteImageDraft.error}
-                      </p>
-                    )}
-                    <button
-                      disabled={isSavingNote}
-                      className={`mt-3 w-full ${buttonClass}`}
+                  )}
+                  {detailTab === "history" && (
+                    <div
+                      id="detail-panel-history"
+                      role="tabpanel"
+                      aria-labelledby="detail-tab-history"
+                      className="pt-5"
                     >
-                      {isSavingNote ? "Menyimpan..." : "Simpan progress"}
-                    </button>
-                  </form>
-                  <div>
-                    <h3 className="mb-3 font-semibold">Catatan Progress</h3>
-                    <div className="space-y-3">
-                      {selectedProjectNotes.map((note) => (
-                        <div
-                          key={note.id}
-                          className={`rounded-2xl ${softCardBg} p-3`}
-                        >
-                          <div className="mb-2 flex justify-between gap-2">
-                            <p className="text-[12px] font-bold">
-                              {formatInputDate(note.noteDate)}
-                            </p>
-                            <button
-                              type="button"
-                              onClick={() => deleteNote(note.id)}
-                              className="text-[12px] font-bold text-red-500"
+                      <div className="space-y-4">
+                        {activityRows
+                          .filter(
+                            (item) => item.projectId === selectedProject.id,
+                          )
+                          .map((activity) => (
+                            <article
+                              key={activity.id}
+                              className={`border-l-2 ${borderColor} pl-4`}
                             >
-                              Hapus
-                            </button>
-                          </div>
-                          <p className="whitespace-pre-wrap break-words text-[13px] leading-5">
-                            {note.note}
-                          </p>
-                          <NoteImageGallery
-                            images={note.attachments}
-                            onOpen={openNoteImages}
-                          />
-                        </div>
-                      ))}
+                              <p className={`text-xs ${mutedText}`}>
+                                {activity.date}
+                              </p>
+                              <h3 className="mt-1 font-medium">
+                                {activity.title}
+                              </h3>
+                              <p
+                                className={`mt-1 whitespace-pre-wrap break-words ${mutedText}`}
+                              >
+                                {activity.note}
+                              </p>
+                            </article>
+                          ))}
+                      </div>
+                      {!activityRows.some(
+                        (item) => item.projectId === selectedProject.id,
+                      ) && (
+                        <p className={`py-5 text-center ${mutedText}`}>
+                          Belum ada riwayat untuk pekerjaan ini.
+                        </p>
+                      )}
                     </div>
-                    {selectedProjectNotes.length === 0 && (
-                      <p className={`text-[13px] ${mutedText}`}>
-                        Belum ada catatan progress.
-                      </p>
-                    )}
-                  </div>
-                </div>
-              )}
-            </section>
+                  )}
+                </section>
+              </>
+            )}
           </div>
         )}
 
@@ -4043,8 +5068,7 @@ export default function Home() {
                     type="button"
                     className={`mt-3 ${secondaryButton}`}
                     onClick={() => {
-                      setSelectedProjectId(selectedHistoryProject.id);
-                      openMenuPage("project");
+                      selectCase(selectedHistoryProject);
                     }}
                   >
                     Buka detail kasus
@@ -4207,8 +5231,7 @@ export default function Home() {
                             className={secondaryButton}
                             onClick={() => {
                               resetFilters();
-                              setSelectedProjectId(project.id);
-                              openMenuPage("project");
+                              selectCase(project);
                             }}
                           >
                             Buka kasus
@@ -4381,8 +5404,10 @@ export default function Home() {
                         className={secondaryButton}
                         onClick={() => {
                           resetFilters();
-                          setSelectedProjectId(note.projectId);
-                          openMenuPage("project");
+                          const project = projects.find(
+                            (item) => item.id === note.projectId,
+                          );
+                          if (project) selectCase(project);
                         }}
                       >
                         Buka kasus
@@ -4464,6 +5489,368 @@ export default function Home() {
                 <p className={mutedText}>Belum ada data sesuai filter.</p>
               )}
             </section>
+          </div>
+        )}
+
+        {activeMenu === "upgradeNotes" && (
+          <div className="mx-auto max-w-4xl space-y-5">
+            <section className={panelClass}>
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <p className={`text-xs font-medium ${smallAccent}`}>
+                    LARAVEL 13 · PHP 8.5
+                  </p>
+                  <h2 className="mt-2 text-2xl font-semibold">
+                    Catatan Upgrade
+                  </h2>
+                  <p className={`mt-2 ${mutedText}`}>
+                    Simpan perubahan dari PHP 7.2 / 8.2, temuan error, dan
+                    solusi yang sudah dicoba.
+                  </p>
+                </div>
+                {upgradeView === "list" && (
+                  <button
+                    type="button"
+                    disabled={upgradeSaving || Boolean(upgradeDeleting)}
+                    onClick={() => openUpgradeEditor()}
+                    className={buttonClass}
+                  >
+                    ＋ Tulis catatan
+                  </button>
+                )}
+              </div>
+            </section>
+            {upgradeError && (
+              <p
+                role="alert"
+                className="rounded-xl border border-rose-500/30 p-3 text-rose-500"
+              >
+                {upgradeError}
+              </p>
+            )}
+            {upgradeNotice && (
+              <p role="status" className={smallAccent}>
+                {upgradeNotice}
+              </p>
+            )}
+            {upgradeView === "list" && (
+              <>
+                <section className={panelClass}>
+                  <label className="block">
+                    <span className={`mb-2 block text-xs ${mutedText}`}>
+                      Cari catatan
+                    </span>
+                    <input
+                      type="search"
+                      value={upgradeSearch}
+                      onChange={(e) => setUpgradeSearch(e.target.value)}
+                      className={inputClass}
+                      placeholder="Cari judul, isi, error, atau nama project..."
+                    />
+                  </label>
+                  <div className="mt-3 flex flex-wrap items-end gap-3">
+                    <label className="min-w-40 flex-1">
+                      <span className={`mb-1 block text-xs ${mutedText}`}>
+                        Topik
+                      </span>
+                      <select
+                        value={upgradeFilter}
+                        onChange={(e) => setUpgradeFilter(e.target.value)}
+                        className={inputClass}
+                      >
+                        <option value="">Semua topik</option>
+                        {upgradeTopics.map((name) => (
+                          <option key={name}>{name}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="min-w-40 flex-1">
+                      <span className={`mb-1 block text-xs ${mutedText}`}>
+                        Versi asal
+                      </span>
+                      <select
+                        value={upgradeSourceFilter}
+                        onChange={(e) => setUpgradeSourceFilter(e.target.value)}
+                        className={inputClass}
+                      >
+                        <option value="">Semua versi</option>
+                        {upgradeSources.map((name) => (
+                          <option key={name}>{name}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <button
+                      type="button"
+                      disabled={
+                        upgradeLoading ||
+                        upgradeSaving ||
+                        Boolean(upgradeDeleting)
+                      }
+                      onClick={() => void fetchUpgradeNotes()}
+                      className={secondaryButton}
+                    >
+                      {upgradeLoading ? "Memuat..." : "Refresh"}
+                    </button>
+                    {(upgradeSearch ||
+                      upgradeFilter ||
+                      upgradeSourceFilter) && (
+                      <button
+                        type="button"
+                        className={secondaryButton}
+                        onClick={() => {
+                          setUpgradeSearch("");
+                          setUpgradeFilter("");
+                          setUpgradeSourceFilter("");
+                        }}
+                      >
+                        Reset filter
+                      </button>
+                    )}
+                  </div>
+                </section>
+                {upgradeLoading && (
+                  <p role="status" className={mutedText}>
+                    Memuat catatan...
+                  </p>
+                )}
+                <div className="space-y-3">
+                  {filteredUpgradeNotes.map((note) => (
+                    <button
+                      type="button"
+                      key={note.id}
+                      onClick={() => {
+                        setUpgradeSelectedId(note.id);
+                        setUpgradeView("read");
+                        setUpgradeNotice("");
+                        window.scrollTo({ top: 0, behavior: "smooth" });
+                      }}
+                      className={`w-full text-left ${panelClass} transition-colors hover:border-emerald-400/60`}
+                    >
+                      <div
+                        className={`flex flex-wrap justify-between gap-2 text-xs ${mutedText}`}
+                      >
+                        <span>
+                          {note.topic} · {note.sourceVersion}
+                          {note.projectName ? ` · ${note.projectName}` : ""}
+                        </span>
+                        <span>{formatInputDate(note.noteDate)}</span>
+                      </div>
+                      <h3 className="mt-3 break-words text-base font-semibold">
+                        {note.title}
+                      </h3>
+                      <p
+                        className={`mt-2 line-clamp-2 break-words ${mutedText}`}
+                      >
+                        {note.body}
+                      </p>
+                      <span
+                        className={`mt-3 inline-block text-xs font-medium ${smallAccent}`}
+                      >
+                        Baca catatan →
+                      </span>
+                    </button>
+                  ))}
+                </div>
+                {!upgradeLoading &&
+                  !upgradeError &&
+                  !filteredUpgradeNotes.length && (
+                    <section className={`${panelClass} py-12 text-center`}>
+                      <h3 className="text-lg font-semibold">
+                        {upgradeNotes.length
+                          ? "Tidak ada catatan yang cocok"
+                          : "Mulai kumpulkan catatan upgrademu"}
+                      </h3>
+                      <p className={`mx-auto mt-2 max-w-md ${mutedText}`}>
+                        {upgradeNotes.length
+                          ? "Coba kata kunci lain atau reset filter."
+                          : "Catat perubahan kode, konfigurasi, atau solusi error supaya mudah ditemukan lagi."}
+                      </p>
+                      {!upgradeNotes.length && (
+                        <button
+                          type="button"
+                          onClick={() => openUpgradeEditor()}
+                          className={`mt-5 ${buttonClass}`}
+                        >
+                          ＋ Tulis catatan pertama
+                        </button>
+                      )}
+                    </section>
+                  )}
+              </>
+            )}
+            {upgradeView === "read" && (
+              <>
+                <button
+                  type="button"
+                  disabled={Boolean(upgradeDeleting)}
+                  className={secondaryButton}
+                  onClick={() => setUpgradeView("list")}
+                >
+                  ← Kembali ke catatan
+                </button>
+                {selectedUpgradeNote ? (
+                  <article className={`${panelClass} space-y-5 sm:p-6`}>
+                    <div
+                      className={`flex flex-wrap gap-2 text-xs ${mutedText}`}
+                    >
+                      <span>{selectedUpgradeNote.topic}</span>
+                      <span>
+                        · {selectedUpgradeNote.sourceVersion} → PHP 8.5
+                      </span>
+                      {selectedUpgradeNote.projectName && (
+                        <span>· {selectedUpgradeNote.projectName}</span>
+                      )}
+                    </div>
+                    <h2 className="break-words text-2xl font-semibold">
+                      {selectedUpgradeNote.title}
+                    </h2>
+                    <p className={`text-xs ${mutedText}`}>
+                      {formatInputDate(selectedUpgradeNote.noteDate)}
+                    </p>
+                    <pre
+                      className={`whitespace-pre-wrap break-words rounded-xl border ${borderColor} ${softCardBg} p-4 font-mono text-[13px] leading-7`}
+                    >
+                      {selectedUpgradeNote.body}
+                    </pre>
+                    <div className="flex flex-wrap gap-3">
+                      <button
+                        type="button"
+                        disabled={Boolean(upgradeDeleting)}
+                        className={buttonClass}
+                        onClick={() => openUpgradeEditor(selectedUpgradeNote)}
+                      >
+                        Edit catatan
+                      </button>
+                      <button
+                        type="button"
+                        disabled={Boolean(upgradeDeleting)}
+                        className="rounded-xl border border-rose-500/30 px-3 py-2 text-rose-500 disabled:opacity-50"
+                        onClick={() =>
+                          void deleteUpgradeNote(selectedUpgradeNote)
+                        }
+                      >
+                        {upgradeDeleting ? "Menghapus..." : "Hapus catatan"}
+                      </button>
+                    </div>
+                  </article>
+                ) : (
+                  <p className={mutedText}>
+                    Catatan tidak ditemukan. Kembali ke daftar untuk memuat
+                    ulang.
+                  </p>
+                )}
+              </>
+            )}
+            {upgradeView === "edit" && (
+              <section className={`${panelClass} sm:p-6`}>
+                <button
+                  type="button"
+                  disabled={upgradeSaving}
+                  className={`mb-5 ${secondaryButton}`}
+                  onClick={() => {
+                    setUpgradeView(upgradeEditingId ? "read" : "list");
+                    resetUpgradeDraft();
+                    setUpgradeError("");
+                  }}
+                >
+                  ← Batal dan kembali
+                </button>
+                <h2 className="mb-5 text-xl font-semibold">
+                  {upgradeEditingId ? "Edit catatan" : "Tulis catatan baru"}
+                </h2>
+                <form onSubmit={saveUpgradeNote} className="space-y-4">
+                  <fieldset disabled={upgradeSaving} className="space-y-4">
+                    <label className="block">
+                      Judul *
+                      <input
+                        autoFocus
+                        required
+                        maxLength={200}
+                        value={upgradeTitle}
+                        onChange={(e) => setUpgradeTitle(e.target.value)}
+                        className={`mt-2 ${inputClass}`}
+                        placeholder="Contoh: perubahan query saat upgrade"
+                      />
+                    </label>
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <label>
+                        Topik
+                        <select
+                          value={upgradeTopic}
+                          onChange={(e) =>
+                            setUpgradeTopic(e.target.value as UpgradeTopic)
+                          }
+                          className={`mt-2 ${inputClass}`}
+                        >
+                          {upgradeTopics.map((name) => (
+                            <option key={name}>{name}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        Versi asal
+                        <select
+                          value={upgradeSource}
+                          onChange={(e) =>
+                            setUpgradeSource(e.target.value as UpgradeSource)
+                          }
+                          className={`mt-2 ${inputClass}`}
+                        >
+                          {upgradeSources.map((name) => (
+                            <option key={name}>{name}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        Project (opsional)
+                        <input
+                          list="upgrade-project-options"
+                          value={upgradeProject}
+                          onChange={(e) => setUpgradeProject(e.target.value)}
+                          className={`mt-2 ${inputClass}`}
+                          placeholder="Umum / pilih project"
+                        />
+                        <datalist id="upgrade-project-options">
+                          {clientOptions.map((name) => (
+                            <option key={name} value={name} />
+                          ))}
+                        </datalist>
+                      </label>
+                      <label>
+                        Tanggal *
+                        <input
+                          required
+                          type="date"
+                          value={upgradeDate}
+                          onChange={(e) => setUpgradeDate(e.target.value)}
+                          className={`mt-2 ${inputClass}`}
+                        />
+                      </label>
+                    </div>
+                    <label className="block">
+                      Isi catatan *
+                      <textarea
+                        required
+                        maxLength={100000}
+                        value={upgradeBody}
+                        onChange={(e) => setUpgradeBody(e.target.value)}
+                        className={`mt-2 min-h-[320px] font-mono ${inputClass}`}
+                        placeholder={
+                          "Yang berubah:\n\nKode / konfigurasi lama:\n\nKode / konfigurasi baru:\n\nError dan solusi:\n\nHasil pengujian / referensi:"
+                        }
+                      />
+                    </label>
+                    <p className={`text-xs ${mutedText}`}>
+                      Bisa diisi catatan bebas atau potongan kode. Baris dan
+                      spasi akan disimpan sesuai yang kamu tulis.
+                    </p>
+                  </fieldset>
+                  <button disabled={upgradeSaving} className={buttonClass}>
+                    {upgradeSaving ? "Menyimpan..." : "Simpan catatan"}
+                  </button>
+                </form>
+              </section>
+            )}
           </div>
         )}
 
@@ -4906,7 +6293,7 @@ export default function Home() {
               <div>
                 <h2 id="completion-title" className="text-[16px] font-semibold">
                   {completionProject.status === "Selesai"
-                    ? "Ubah tanggal selesai"
+                    ? "Pekerjaan selesai"
                     : "Tandai Beres"}
                 </h2>
                 <p className={`mt-2 break-words text-[13px] ${mutedText}`}>
@@ -4931,30 +6318,12 @@ export default function Home() {
               {completionProject.requesterPic || "Belum diisi"}
             </p>
             <form onSubmit={completeProject} className="space-y-3">
-              <label className="block">
-                <span
-                  className={`mb-1 block text-[12px] font-medium ${mutedText}`}
-                >
-                  Tanggal selesai *
-                </span>
-                <input
-                  aria-label="Tanggal selesai"
-                  autoFocus
-                  type="date"
-                  className={inputClass}
-                  value={completionDateInput}
-                  onChange={(event) =>
-                    setCompletionDateInput(event.target.value)
-                  }
-                  min={completionProject.masukDate || undefined}
-                  max={getTodayInputDate()}
-                  required
-                  disabled={isCompleting}
-                />
-              </label>
-              <p className={`text-[12px] ${mutedText}`}>
-                Default hari ini. Kamu boleh memilih tanggal sebelumnya jika
-                pekerjaan sudah selesai lebih awal.
+              <p className={mutedText}>
+                Tanggal selesai otomatis:{" "}
+                {formatInputDate(
+                  completionOnSave("Selesai", completionProject),
+                )}
+                . Tanggal dicatat saat menekan Simpan.
               </p>
               {tasks.some(
                 (item) =>
@@ -5066,43 +6435,176 @@ export default function Home() {
       )}
 
       {clientPickerOpen && (
-        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={() => setClientPickerOpen(false)}>
-          <section role="dialog" aria-modal="true" aria-labelledby="client-picker-title" onClick={e => e.stopPropagation()} onKeyDown={e => { if (e.key === "Escape") setClientPickerOpen(false); }} className={`flex max-h-[80dvh] w-full max-w-lg flex-col ${panelClass} shadow-2xl`}>
-            <div className="mb-4 flex items-center justify-between"><h2 id="client-picker-title" className="text-[18px] font-semibold">Pilih Client</h2><button type="button" aria-label="Tutup pilihan client" className={secondaryButton} onClick={() => setClientPickerOpen(false)}>×</button></div>
-            <input autoFocus aria-label="Cari client untuk project" className={inputClass} placeholder="Cari nama client..." value={clientPickerSearch} onChange={e => setClientPickerSearch(e.target.value)} />
-            <div className="mt-3 min-h-0 space-y-2 overflow-y-auto">{clientOptions.filter(name => name.toLowerCase().includes(clientPickerSearch.toLowerCase())).map(name => <button type="button" key={name} className={`flex w-full items-center justify-between rounded-xl border ${borderColor} p-4 text-left hover:bg-emerald-400/10`} onClick={() => { setTransactionClient(name); setClientPickerOpen(false); setGridNotice(""); }}><span>{name}</span><span aria-hidden="true">{transactionClient === name ? "✓" : "→"}</span></button>)}
-              {!clientOptions.some(name => name.toLowerCase().includes(clientPickerSearch.toLowerCase())) && <p className={`p-4 ${mutedText}`}>Client tidak ditemukan. Tambahkan melalui Master → Client.</p>}
+        <div
+          className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+          onClick={() => setClientPickerOpen(false)}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="client-picker-title"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setClientPickerOpen(false);
+            }}
+            className={`flex max-h-[80dvh] w-full max-w-lg flex-col ${panelClass} shadow-2xl`}
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <h2
+                id="client-picker-title"
+                className="text-[18px] font-semibold"
+              >
+                Pilih Client
+              </h2>
+              <button
+                type="button"
+                aria-label="Tutup pilihan client"
+                className={secondaryButton}
+                onClick={() => setClientPickerOpen(false)}
+              >
+                ×
+              </button>
+            </div>
+            <input
+              autoFocus
+              aria-label="Cari client untuk project"
+              className={inputClass}
+              placeholder="Cari nama client..."
+              value={clientPickerSearch}
+              onChange={(e) => setClientPickerSearch(e.target.value)}
+            />
+            <div className="mt-3 min-h-0 space-y-2 overflow-y-auto">
+              {clientOptions
+                .filter((name) =>
+                  name.toLowerCase().includes(clientPickerSearch.toLowerCase()),
+                )
+                .map((name) => (
+                  <button
+                    type="button"
+                    key={name}
+                    className={`flex w-full items-center justify-between rounded-xl border ${borderColor} p-4 text-left hover:bg-emerald-400/10`}
+                    onClick={() => {
+                      setTransactionClient(name);
+                      setClientPickerOpen(false);
+                      setGridNotice("");
+                    }}
+                  >
+                    <span>{name}</span>
+                    <span aria-hidden="true">
+                      {transactionClient === name ? "✓" : "→"}
+                    </span>
+                  </button>
+                ))}
+              {!clientOptions.some((name) =>
+                name.toLowerCase().includes(clientPickerSearch.toLowerCase()),
+              ) && (
+                <p className={`p-4 ${mutedText}`}>
+                  Client tidak ditemukan. Tambahkan melalui Master → Client.
+                </p>
+              )}
             </div>
           </section>
         </div>
       )}
-      {isNavigationMenuOpen && <button type="button" aria-label="Tutup navigasi" onClick={() => setIsNavigationMenuOpen(false)} className="fixed inset-0 z-[55] bg-black/50 backdrop-blur-sm lg:hidden" />}
-      <aside className={`fixed inset-y-0 left-0 z-[60] flex w-60 flex-col border-r ${borderColor} ${cardBg} transition-transform duration-200 ${isNavigationMenuOpen ? "translate-x-0" : "-translate-x-full"} lg:translate-x-0`}>
+      {isNavigationMenuOpen && (
+        <button
+          type="button"
+          aria-label="Tutup navigasi"
+          onClick={() => setIsNavigationMenuOpen(false)}
+          className="fixed inset-0 z-[55] bg-black/50 backdrop-blur-sm lg:hidden"
+        />
+      )}
+      <aside
+        className={`fixed inset-y-0 left-0 z-[60] flex w-60 flex-col border-r ${borderColor} ${cardBg} transition-transform duration-200 ${isNavigationMenuOpen ? "translate-x-0" : "-translate-x-full"} lg:translate-x-0`}
+      >
         <div className="flex items-center justify-between px-5 pb-6 pt-8">
-          <div><p className={`text-[18px] font-bold tracking-tight ${smallAccent}`}>◈ Office Nowmy</p><p className={`mt-1 text-[11px] ${mutedText}`}>Sedikit lebih teratur, setiap hari.</p></div>
-          <button type="button" aria-label="Tutup navigasi" onClick={() => setIsNavigationMenuOpen(false)} className="p-2 lg:hidden">×</button>
+          <div>
+            <p
+              className={`text-[18px] font-bold tracking-tight ${smallAccent}`}
+            >
+              ◈ Kerja Nowmy
+            </p>
+            <p className={`mt-1 text-[11px] ${mutedText}`}>
+              Sedikit lebih teratur, setiap hari.
+            </p>
+          </div>
+          <button
+            type="button"
+            aria-label="Tutup navigasi"
+            onClick={() => setIsNavigationMenuOpen(false)}
+            className="p-2 lg:hidden"
+          >
+            ×
+          </button>
         </div>
-        <nav aria-label="Navigasi utama" className="min-h-0 flex-1 space-y-1 overflow-y-auto px-3 pb-4">
+        <nav
+          aria-label="Navigasi utama"
+          className="min-h-0 flex-1 space-y-1 overflow-y-auto px-3 pb-4"
+        >
           {[
-            ["dashboard", "◈", "Dashboard"], ["client", "▦", "Client"],
-            ["projects", "▤", "Daftar Project"], ["tugas", "☑", "Tugas"],
-            ["catatan", "✎", "Catatan"], ["query", "⌘", "Query"],
-            ["riwayat", "◷", "Riwayat"], ["laporan", "▥", "Laporan"],
+            ["dashboard", "◈", "Dashboard"],
+            ["client", "▦", "Project & Modul"],
+            ["projects", "▤", "Catat Kerja"],
+            ["tugas", "☑", "Tugas"],
+            ["catatan", "✎", "Catatan Kerja"],
+            ["upgradeNotes", "↗", "Catatan Upgrade"],
+            ["query", "⌘", "Query"],
+            ["riwayat", "◷", "Riwayat"],
+            ["laporan", "▥", "Laporan"],
             ["settings", "⚙", "Settings"],
           ].map(([id, icon, label]) => (
             <div key={id}>
-            {id === "client" && <p className={`px-4 pb-2 pt-5 text-[10px] font-bold uppercase tracking-widest ${mutedText}`}>Master</p>}
-            {id === "projects" && <p className={`px-4 pb-2 pt-5 text-[10px] font-bold uppercase tracking-widest ${mutedText}`}>Transaksi</p>}
-            {id === "tugas" && <p className={`px-4 pb-2 pt-5 text-[10px] font-bold uppercase tracking-widest ${mutedText}`}>Ruang kerja</p>}
-            <button type="button" aria-current={activeMenu === id ? "page" : undefined}
-              onClick={() => { openMenuPage(id as ActiveMenu); setIsNavigationMenuOpen(false); }}
-              className={`flex min-h-[46px] w-full items-center gap-3 rounded-xl px-4 py-3 text-left text-[13px] transition-colors ${activeMenu === id ? "bg-[#A7F3D0] font-semibold text-[#111214]" : `${mutedText} hover:bg-emerald-400/10`}`}>
-              <span aria-hidden="true" className="w-5 text-center text-[18px]">{icon}</span>{label}
-            </button></div>
+              {id === "client" && (
+                <p
+                  className={`px-4 pb-2 pt-5 text-[10px] font-bold uppercase tracking-widest ${mutedText}`}
+                >
+                  Master
+                </p>
+              )}
+              {id === "projects" && (
+                <p
+                  className={`px-4 pb-2 pt-5 text-[10px] font-bold uppercase tracking-widest ${mutedText}`}
+                >
+                  Transaksi
+                </p>
+              )}
+              {id === "tugas" && (
+                <p
+                  className={`px-4 pb-2 pt-5 text-[10px] font-bold uppercase tracking-widest ${mutedText}`}
+                >
+                  Ruang kerja
+                </p>
+              )}
+              <button
+                type="button"
+                aria-current={activeMenu === id ? "page" : undefined}
+                onClick={() => {
+                  openMenuPage(id as ActiveMenu);
+                  setIsNavigationMenuOpen(false);
+                }}
+                className={`flex min-h-[46px] w-full items-center gap-3 rounded-xl px-4 py-3 text-left text-[13px] transition-colors ${activeMenu === id ? "bg-[#A7F3D0] font-semibold text-[#111214]" : `${mutedText} hover:bg-emerald-400/10`}`}
+              >
+                <span
+                  aria-hidden="true"
+                  className="w-5 text-center text-[18px]"
+                >
+                  {icon}
+                </span>
+                {label}
+              </button>
+            </div>
           ))}
         </nav>
         <div className={`border-t ${borderColor} p-4`}>
-          <div className="flex items-center gap-3"><span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-400/15 font-semibold text-emerald-500">{username.slice(0, 1).toUpperCase()}</span><div className="min-w-0"><p className="truncate text-[12px] font-semibold">{username}</p><p className={`text-[11px] ${mutedText}`}>Ruang kerja pribadi</p></div></div>
+          <div className="flex items-center gap-3">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-400/15 font-semibold text-emerald-500">
+              {username.slice(0, 1).toUpperCase()}
+            </span>
+            <div className="min-w-0">
+              <p className="truncate text-[12px] font-semibold">{username}</p>
+              <p className={`text-[11px] ${mutedText}`}>Ruang kerja pribadi</p>
+            </div>
+          </div>
         </div>
       </aside>
     </main>
