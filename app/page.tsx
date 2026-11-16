@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useId as ReactUseId } from "react";
 import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
@@ -157,7 +157,35 @@ type WorkProject = {
   createdAtMillis: number;
 };
 
+const testingKinds = ["Monitoring", "Master", "Transaksi", "Report"] as const;
+const testingStatuses = ["Berhasil", "Mengalami Kendala", "Perlu Penyempurnaan"] as const;
+type TestingResult = {
+  resolved?: boolean;
+  kind: (typeof testingKinds)[number];
+  status: (typeof testingStatuses)[number];
+  repairNote: string;
+};
+const readTestingResult = (value: unknown): TestingResult | undefined => {
+  if (!value || typeof value !== "object") return undefined;
+  const result = value as TestingResult;
+  return testingKinds.includes(result.kind) && testingStatuses.includes(result.status)
+    && typeof result.repairNote === "string" ? result : undefined;
+};
+function TestingSummary({ result }: { result?: TestingResult }) {
+  if (!result) return null;
+  return <div className="my-3 space-y-2 text-xs">
+    <div className="flex flex-wrap gap-2">
+      <span className="rounded-lg border border-neutral-500/30 px-2 py-1">Pengujian · {result.kind}</span>
+      <span className={`rounded-lg border px-2 py-1 ${result.status === "Berhasil" ? "border-emerald-500/40 text-emerald-500" : result.status === "Mengalami Kendala" ? "border-rose-500/40 text-rose-500" : "border-amber-500/40 text-amber-500"}`}>{result.status}</span>
+    </div>
+    {result.resolved && <p className="font-medium text-emerald-500">✓ Sudah diperbaiki</p>}
+    {result.repairNote && <div className="rounded-lg border border-neutral-500/30 p-3"><p className="font-semibold">Catatan perbaikan</p><p className="mt-1 whitespace-pre-wrap break-words">{result.repairNote}</p></div>}
+  </div>;
+}
+
 type ProjectNote = {
+  formName?: string;
+  testing?: TestingResult;
   attachments: NoteAttachment[];
   id: string;
   projectId: string;
@@ -166,6 +194,192 @@ type ProjectNote = {
   createdAtText: string;
   createdAtMillis: number;
 };
+
+const testingIsDone = (note: ProjectNote) => !!note.testing && (note.testing.status === "Berhasil" || note.testing.resolved === true);
+
+function CompactNotes({ notes, onEdit, onDelete, onResolve, onOpenImages, inputClass, secondaryButton }: {
+  notes: ProjectNote[];
+  onEdit: (note: ProjectNote) => void;
+  onDelete: (id: string) => void;
+  onResolve: (note: ProjectNote, resolved: boolean) => Promise<void>;
+  onOpenImages: (images: ImagePreview[], index: number) => void;
+  inputClass: string;
+  secondaryButton: string;
+}) {
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("Semua");
+  const [page, setPage] = useState(1);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const testing = notes.filter(note => note.testing);
+  const done = testing.filter(testingIsDone).length;
+  const filtered = notes.filter(note => {
+    const matches = `${note.note} ${note.formName ?? ""} ${note.testing?.kind ?? ""} ${note.testing?.repairNote ?? ""} ${note.testing?.status ?? ""}`.toLowerCase().includes(search.trim().toLowerCase());
+    return matches && (filter === "Semua" || (filter === "Sudah beres" ? testingIsDone(note) : filter === "Perlu ditindaklanjuti" ? !!note.testing && !testingIsDone(note) : note.testing?.kind === filter));
+  });
+  const pages = Math.max(1, Math.ceil(filtered.length / 6));
+  const currentPage = Math.min(page, pages);
+  const resolve = async (note: ProjectNote) => {
+    if (busy) return;
+    setBusy(note.id);
+    setError("");
+    try { await onResolve(note, !note.testing?.resolved); }
+    catch { setError("Status belum tersimpan. Silakan coba lagi."); }
+    finally { setBusy(""); }
+  };
+  return <div className="space-y-3">
+    {testing.length > 0 && <div className="flex flex-wrap gap-2 text-xs">
+      <span className="rounded-lg border border-neutral-500/25 px-3 py-2">{testing.length} pengujian</span>
+      <span className="rounded-lg border border-emerald-500/25 px-3 py-2 text-emerald-500">✓ {done} sudah beres</span>
+      <span className="rounded-lg border border-amber-500/25 px-3 py-2 text-amber-500">{testing.length - done} perlu ditindaklanjuti</span>
+    </div>}
+    <div className="flex flex-col gap-2 sm:flex-row">
+      <input aria-label="Cari catatan pengujian" className={inputClass} placeholder="Cari catatan atau perbaikan..." value={search} onChange={event => { setSearch(event.target.value); setPage(1); }} />
+      <select aria-label="Filter catatan" className={`${inputClass} sm:max-w-52`} value={filter} onChange={event => { setFilter(event.target.value); setPage(1); }}>{["Semua", "Perlu ditindaklanjuti", "Sudah beres", ...testingKinds].map(item => <option key={item}>{item}</option>)}</select>
+    </div>
+    {error && <p role="alert" className="text-xs text-rose-500">{error}</p>}
+    <div className="divide-y divide-neutral-500/20 rounded-xl border border-neutral-500/25">
+      {filtered.slice((currentPage - 1) * 6, currentPage * 6).map(note => <div key={note.id} className="p-3">
+        <div className="flex items-start gap-3">
+          {note.testing && <button type="button" disabled={!!busy || note.testing.status === "Berhasil"} onClick={() => void resolve(note)} aria-label={testingIsDone(note) ? "Tandai perlu ditindaklanjuti" : "Tandai sudah diperbaiki"} aria-pressed={testingIsDone(note)} title={note.testing.status === "Berhasil" ? "Pengujian berhasil" : testingIsDone(note) ? "Batalkan tanda selesai" : "Tandai sudah diperbaiki"} className={`mt-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-sm ${testingIsDone(note) ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-500" : "border-neutral-500/40"} disabled:cursor-default`}>{busy === note.id ? "…" : testingIsDone(note) ? "✓" : "○"}</button>}
+          <details className="min-w-0 flex-1">
+            <summary className="cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+              <div className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] opacity-75"><span>{formatInputDate(note.noteDate)}</span>{note.formName && <span>· {note.formName}</span>}{note.testing && <><span>· {note.testing.kind}</span><span className={testingIsDone(note) ? "text-emerald-500" : "text-amber-500"}>{testingIsDone(note) ? "✓ Sudah beres" : note.testing.status}</span></>}</div>
+              <p className="line-clamp-2 break-words text-sm">{note.note || "Catatan gambar"}</p>
+              <span className="mt-1 inline-block text-[11px] opacity-60">Buka / tutup detail ▾</span>
+            </summary>
+            <div className="mt-3 border-t border-neutral-500/20 pt-3">
+              <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{note.note}</p>
+              <TestingSummary result={note.testing} />
+              <NoteImageGallery images={note.attachments} onOpen={onOpenImages} />
+              {!note.testing && <button type="button" onClick={() => onDelete(note.id)} className="mt-3 text-xs text-rose-500">Hapus catatan</button>}
+            </div>
+          </details>
+          <button type="button" className="shrink-0 py-1 text-xs font-medium" onClick={() => onEdit(note)}>Edit</button>
+        </div>
+      </div>)}
+      {!filtered.length && <p className="p-5 text-center text-xs opacity-60">{notes.length ? "Tidak ada catatan yang sesuai filter." : "Belum ada catatan untuk pekerjaan ini."}</p>}
+    </div>
+    {filtered.length > 0 && <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+      <span>{(currentPage - 1) * 6 + 1}–{Math.min(currentPage * 6, filtered.length)} dari {filtered.length} catatan</span>
+      <div className="flex items-center gap-2"><button type="button" className={secondaryButton} disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}>← Sebelumnya</button><span>{currentPage} / {pages}</span><button type="button" className={secondaryButton} disabled={currentPage >= pages} onClick={() => setPage(currentPage + 1)}>Berikutnya →</button></div>
+    </div>}
+  </div>;
+}
+
+function FormCombobox({ value, onChange, options, onCreate, disabled, inputClass }: {
+  value: string; onChange: (value: string) => void; options: string[];
+  onCreate: (name: string) => Promise<void>; disabled?: boolean; inputClass: string;
+}) {
+  const [search, setSearch] = useState(value);
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [active, setActive] = useState(0);
+  const listId = ReactUseId();
+  useEffect(() => { if (!open) setSearch(value); }, [value, open]);
+  const matches = options.filter(name => name.toLowerCase().includes(search.trim().toLowerCase()));
+  const canCreate = !!search.trim() && !options.some(name => name.toLowerCase() === search.trim().toLowerCase());
+  const choose = (name: string) => { onChange(name); setSearch(name); setOpen(false); setError(""); };
+  const create = async () => {
+    if (busy || !canCreate) return;
+    setBusy(true); setError("");
+    try { await onCreate(search.trim()); choose(search.trim()); }
+    catch { setError("Master form belum tersimpan. Periksa koneksi dan coba lagi."); }
+    finally { setBusy(false); }
+  };
+  return <div className="relative" onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget)) { setOpen(false); setSearch(value); } }}>
+    <label className="block text-xs" htmlFor={listId}>Form <span className="opacity-60">(opsional)</span></label>
+    <input id={listId} role="combobox" aria-expanded={open} aria-controls={`${listId}-options`} aria-autocomplete="list" aria-activedescendant={open && matches[active] ? `${listId}-${active}` : undefined} autoComplete="off" className={`mt-1 ${inputClass}`} value={search} disabled={disabled || busy} placeholder="Cari atau tambah master form..." onFocus={() => setOpen(true)} onChange={event => { setSearch(event.target.value); onChange(""); setOpen(true); setActive(0); }} onKeyDown={event => {
+      if (event.key === "Escape") { setOpen(false); setSearch(value); }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); setOpen(true); setActive(index => Math.max(0, Math.min(matches.length - 1, index + (event.key === "ArrowDown" ? 1 : -1)))); }
+      if (event.key === "Enter" && open) { event.preventDefault(); if (matches[active]) choose(matches[active]); else if (canCreate) void create(); }
+    }} />
+    {open && <div className="absolute z-30 mt-1 w-full overflow-hidden rounded-xl border border-neutral-500/40 bg-[var(--background)] text-[var(--foreground)] shadow-xl">
+      <div id={`${listId}-options`} role="listbox" className="max-h-48 overflow-y-auto">
+        {matches.map((name, index) => <button id={`${listId}-${index}`} role="option" aria-selected={name === value} type="button" key={name} onMouseDown={event => event.preventDefault()} onMouseEnter={() => setActive(index)} onClick={() => choose(name)} className={`block w-full break-words px-3 py-2 text-left text-xs hover:bg-emerald-500/15 ${index === active ? "bg-emerald-500/10" : ""}`}>{name}{name === value ? " ✓" : ""}</button>)}
+        {!matches.length && <p className="px-3 py-2 text-xs opacity-60">Belum ada form yang sesuai. Ketik nama form untuk menambah master.</p>}
+      </div>
+      {canCreate && <button type="button" disabled={busy} onMouseDown={event => event.preventDefault()} onClick={() => void create()} className="block w-full border-t border-neutral-500/20 px-3 py-3 text-left text-xs font-medium text-emerald-500">{busy ? "Menyimpan..." : `+ Tambah “${search.trim()}” ke master form`}</button>}
+      {value && <button type="button" onMouseDown={event => event.preventDefault()} onClick={() => choose("")} className="block w-full px-3 py-2 text-left text-xs opacity-70">Kosongkan pilihan</button>}
+    </div>}
+    {error && <p role="alert" className="mt-1 text-xs text-rose-500">{error}</p>}
+  </div>;
+}
+
+function CreateNoteModal({ children, title, panelClass, saving, onClose }: {
+  children: React.ReactNode; title: string; panelClass: string; saving: boolean; onClose: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const element = dialog.current;
+    element?.showModal();
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { element?.close(); document.body.style.overflow = previous; };
+  }, []);
+  return <dialog ref={dialog} aria-labelledby="create-note-title" onCancel={event => { event.preventDefault(); if (!saving) onClose(); }} className={`fixed inset-0 m-auto max-h-[85dvh] w-[calc(100%_-_1.5rem)] max-w-2xl overflow-y-auto text-inherit ${panelClass} shadow-2xl backdrop:bg-black/60 backdrop:backdrop-blur-sm`}>
+    <div className="flex items-center justify-between gap-3"><h2 id="create-note-title" className="text-base font-semibold">{title}</h2><button type="button" aria-label="Tutup tambah catatan" disabled={saving} onClick={onClose} className="rounded-lg px-3 py-2 text-lg">×</button></div>
+    {children}
+  </dialog>;
+}
+
+function EditNoteDialog({ note, onClose, onSave, inputClass, buttonClass, secondaryButton, panelClass, formOptions, onCreateForm }: {
+  formOptions: string[];
+  onCreateForm: (name: string) => Promise<void>;
+  note: ProjectNote;
+  onClose: () => void;
+  onSave: (changes: { note: string; noteDate: string; formName: string; testing?: TestingResult }) => Promise<void>;
+  inputClass: string;
+  buttonClass: string;
+  secondaryButton: string;
+  panelClass: string;
+}) {
+  const [formName, setFormName] = useState(note.formName ?? "");
+  const [text, setText] = useState(note.note);
+  const [date, setDate] = useState(note.noteDate);
+  const [kind, setKind] = useState<TestingResult["kind"]>(note.testing?.kind ?? "Monitoring");
+  const [status, setStatus] = useState<TestingResult["status"]>(note.testing?.status ?? "Berhasil");
+  const [repair, setRepair] = useState(note.testing?.repairNote ?? "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (saving) return;
+    if ((!text.trim() && (note.testing || !note.attachments.length)) || (note.testing && status === "Perlu Penyempurnaan" && !repair.trim())) {
+      setError("Lengkapi catatan hasil dan catatan perbaikan yang wajib diisi.");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      await onSave({ note: text.trim(), noteDate: date, formName, ...(note.testing ? { testing: { kind, status, repairNote: repair.trim(), resolved: note.testing.status === status && note.testing.resolved === true } } : {}) });
+      onClose();
+    } catch {
+      setError("Perubahan belum tersimpan. Periksa koneksi dan coba lagi.");
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <div className="fixed inset-0 z-[85] flex items-center justify-center bg-black/60 p-3 backdrop-blur-sm">
+    <section role="dialog" aria-modal="true" aria-labelledby="edit-note-title" className={`max-h-[85dvh] w-full max-w-xl overflow-y-auto ${panelClass} shadow-2xl`} onKeyDown={event => { if (event.key === "Escape" && !saving) onClose(); }}>
+      <h2 id="edit-note-title" className="mb-4 text-base font-semibold">{note.testing ? "Edit hasil pengujian" : "Edit catatan"}</h2>
+      <form onSubmit={submit} className="space-y-3">
+        <label className="block text-xs">Tanggal catatan<input autoFocus required type="date" className={`mt-1 ${inputClass}`} value={date} disabled={saving} onChange={event => setDate(event.target.value)} /></label>
+        <FormCombobox value={formName} onChange={setFormName} options={formOptions} onCreate={onCreateForm} disabled={saving} inputClass={inputClass} />
+        {note.testing && <div className="grid gap-3 sm:grid-cols-2">
+          <label className="block text-xs">Jenis pengujian<select className={`mt-1 ${inputClass}`} value={kind} disabled={saving} onChange={event => setKind(event.target.value as TestingResult["kind"])}>{testingKinds.map(item => <option key={item}>{item}</option>)}</select></label>
+          <label className="block text-xs">Status pengujian<select className={`mt-1 ${inputClass}`} value={status} disabled={saving} onChange={event => setStatus(event.target.value as TestingResult["status"])}>{testingStatuses.map(item => <option key={item}>{item}</option>)}</select></label>
+        </div>}
+        <label className="block text-xs">{note.testing ? "Catatan hasil pengujian" : "Catatan"}<textarea className={`mt-1 min-h-28 ${inputClass}`} required={!!note.testing || !note.attachments.length} value={text} disabled={saving} onChange={event => setText(event.target.value)} /></label>
+        {note.testing && status !== "Berhasil" && <label className="block text-xs">Catatan perbaikan ({status === "Perlu Penyempurnaan" ? "wajib" : "opsional"})<textarea className={`mt-1 min-h-24 ${inputClass}`} required={status === "Perlu Penyempurnaan"} value={repair} disabled={saving} onChange={event => setRepair(event.target.value)} /></label>}
+        {note.attachments.length > 0 && <p className="text-xs">Gambar terlampir tetap tersimpan.</p>}
+        {error && <p role="alert" className="text-xs text-rose-500">{error}</p>}
+        <div className="flex gap-2"><button disabled={saving} className={buttonClass}>{saving ? "Menyimpan..." : "Simpan perubahan"}</button><button type="button" disabled={saving} className={secondaryButton} onClick={onClose}>Batal</button></div>
+      </form>
+    </section>
+  </div>;
+}
 
 type WorkTask = {
   attachments: NoteAttachment[];
@@ -753,6 +967,8 @@ export default function Home() {
   const [loginPassword, setLoginPassword] = useState("");
   const [isLoggingIn, setIsLoggingIn] = useState(false);
 
+  const [masterForms, setMasterForms] = useState<Record<string, string[]>>({});
+  const [noteFormName, setNoteFormName] = useState("");
   const [masterClients, setMasterClients] = useState<string[]>([]);
   const [newClientName, setNewClientName] = useState("");
   const [clientError, setClientError] = useState("");
@@ -772,8 +988,8 @@ export default function Home() {
   const [savingGrid, setSavingGrid] = useState(false);
   const [activeMenu, setActiveMenu] = useState<ActiveMenu>("dashboard");
   const [projectView, setProjectView] = useState<"list" | "detail">("list");
-  const [detailTab, setDetailTab] = useState<"notes" | "tasks" | "history">(
-    "notes",
+  const [detailTab, setDetailTab] = useState<"tasks" | "history" | "savedNotes">(
+    "savedNotes",
   );
   const navigationHistory = useRef<
     { menu: ActiveMenu; view: "list" | "detail"; scroll: number }[]
@@ -786,11 +1002,15 @@ export default function Home() {
 
   const [projects, setProjects] = useState<WorkProject[]>([]);
   const [notes, setNotes] = useState<ProjectNote[]>([]);
+  const [editingNote, setEditingNote] = useState<ProjectNote | null>(null);
+  useEffect(() => { setEditingNote(null); }, [currentUser?.uid]);
   const [tasks, setTasks] = useState<WorkTask[]>([]);
   const [isLoadingProjects, setIsLoadingProjects] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [editingProjectId, setEditingProjectId] = useState("");
   const [selectedProjectId, setSelectedProjectId] = useState("");
+  const [noteModalOpen, setNoteModalOpen] = useState(false);
+  useEffect(() => { setNoteModalOpen(false); }, [selectedProjectId, currentUser?.uid]);
 
   const [title, setTitle] = useState("");
   const [client, setClient] = useState("");
@@ -811,6 +1031,15 @@ export default function Home() {
   const [priority, setPriority] = useState<ProjectPriority>("Normal");
   const [projectNotes, setProjectNotes] = useState("");
 
+  const [testingKind, setTestingKind] = useState<TestingResult["kind"]>("Monitoring");
+  const [testingStatus, setTestingStatus] = useState<TestingResult["status"]>("Berhasil");
+  const [testingRepairNote, setTestingRepairNote] = useState("");
+  useEffect(() => {
+    setNoteFormName("");
+    setTestingKind("Monitoring");
+    setTestingStatus("Berhasil");
+    setTestingRepairNote("");
+  }, [selectedProjectId]);
   const [noteText, setNoteText] = useState("");
   const [noteDate, setNoteDate] = useState(getTodayInputDate());
   const [isSavingNote, setIsSavingNote] = useState(false);
@@ -1066,7 +1295,7 @@ export default function Home() {
         attachments: note.attachments,
         id: `note-${note.id}`,
         type: "Note Progress",
-        title: "Note progress ditambahkan",
+        title: note.testing ? `Pengujian ${note.testing.kind}: ${note.testing.resolved ? "✓ Sudah diperbaiki" : note.testing.status}` : "Note progress ditambahkan",
         projectId: note.projectId,
         projectTitle: project?.title ?? "Kasus tidak ditemukan",
         client: project?.client ?? "",
@@ -1410,6 +1639,8 @@ export default function Home() {
   };
 
   useEffect(() => {
+    setMasterForms({});
+    setNoteFormName("");
     setMasterClients([]);
     setMasterModules({});
     setTransactionModule("");
@@ -1434,6 +1665,10 @@ export default function Home() {
             .map((item) => String(item.data().name || ""))
             .filter(Boolean),
         );
+        setMasterForms(Object.fromEntries(snapshot.docs.map(item => {
+          const data = item.data();
+          return [normalizeClient(String(data.name || "")).toLowerCase(), Array.isArray(data.forms) ? data.forms.filter((name: unknown): name is string => typeof name === "string") : []];
+        })));
         setMasterModules(
           Object.fromEntries(
             snapshot.docs.map((item) => {
@@ -1460,6 +1695,22 @@ export default function Home() {
       cancelled = true;
     };
   }, [currentUser]);
+
+  const formOptionsFor = (clientName: string) => uniqueLabels([
+    ...(masterForms[normalizeClient(clientName).toLowerCase()] ?? []),
+    ...projects.filter(project => normalizeClient(project.client).toLowerCase() === normalizeClient(clientName).toLowerCase()).map(project => project.bladeForm),
+    ...notes.filter(note => projects.some(project => project.id === note.projectId && normalizeClient(project.client).toLowerCase() === normalizeClient(clientName).toLowerCase())).map(note => note.formName ?? ""),
+  ]);
+  const addMasterForm = async (clientName: string, formName: string) => {
+    if (!currentUser) throw new Error("Login diperlukan");
+    const owner = currentUser.uid;
+    const name = normalizeClient(clientName);
+    const form = cleanLabel(formName);
+    if (!form || !name) throw new Error("Nama form dan project diperlukan");
+    await setDoc(doc(db, "workClients", `${owner}_${encodeURIComponent(name.toLowerCase())}`), { userId: owner, name, forms: arrayUnion(form), updatedAt: serverTimestamp() }, { merge: true });
+    if (activeUserId.current !== owner) return;
+    setMasterForms(previous => ({ ...previous, [name.toLowerCase()]: uniqueLabels([...(previous[name.toLowerCase()] ?? []), form]) }));
+  };
 
   const saveMasterClient = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -1792,6 +2043,8 @@ export default function Home() {
           return {
             id: item.id,
             attachments: readNoteAttachments(data.attachments),
+            formName: typeof data.formName === "string" ? data.formName : "",
+            testing: readTestingResult(data.testing),
             projectId: data.projectId ?? "",
             noteDate: data.noteDate ?? "",
             note: data.note ?? "",
@@ -1891,7 +2144,7 @@ export default function Home() {
         navigationHistory.current = [];
         setDetailNotice("");
         setDetailError("");
-        setDetailTab("notes");
+        setDetailTab("savedNotes");
       }
       activeUserId.current = user?.uid ?? null;
       setCurrentUser(user);
@@ -2772,6 +3025,8 @@ export default function Home() {
     draft: ReturnType<typeof useNoteImageDraft>,
     onProgress: (value: number | null) => void,
     controllerRef: { current: AbortController | null },
+    testing?: TestingResult,
+    formName = "",
   ) => {
     if (!currentUser) throw new Error("Login diperlukan");
     const uid = currentUser.uid;
@@ -2803,6 +3058,8 @@ export default function Home() {
         projectTitle: project.title,
         noteDate: date,
         note: text.trim(),
+        formName,
+        ...(testing ? { testing } : {}),
         ...(attachments.length ? { attachments } : {}),
         createdAt: serverTimestamp(),
       });
@@ -2843,6 +3100,11 @@ export default function Home() {
       );
       return;
     }
+    const isTesting = selectedProject.status === "Testing";
+    if (isTesting && (!noteText.trim() || (testingStatus === "Perlu Penyempurnaan" && !testingRepairNote.trim()))) {
+      noteImageDraft.setError("Isi catatan hasil pengujian. Untuk status Perlu Penyempurnaan, catatan perbaikan wajib diisi.");
+      return;
+    }
     const uid = currentUser.uid;
     try {
       setIsSavingNote(true);
@@ -2854,12 +3116,19 @@ export default function Home() {
         noteImageDraft,
         setNoteUploadProgress,
         noteUploadController,
+        isTesting ? { kind: testingKind, status: testingStatus, repairNote: testingStatus === "Berhasil" ? "" : testingRepairNote.trim() } : undefined,
+        noteFormName,
       );
       if (activeUserId.current !== uid) return;
       setNoteText("");
       setNoteDate(getTodayInputDate());
+      setTestingRepairNote("");
+      setNoteFormName("");
+      setTestingStatus("Berhasil");
       noteImageDraft.clear();
       await fetchProjects();
+      setDetailTab("savedNotes");
+      setNoteModalOpen(false);
     } catch (error) {
       if (activeUserId.current === uid) {
         console.error(error);
@@ -3188,6 +3457,11 @@ export default function Home() {
           "Modul/Topik",
           "PIC Peminta",
           "Note",
+          "Form",
+          "Jenis Pengujian",
+          "Status Pengujian",
+          "Catatan Perbaikan",
+          "Tindak Lanjut Pengujian",
           "Status Kasus",
           "Prioritas Kasus",
           "Dibuat",
@@ -3200,6 +3474,11 @@ export default function Home() {
           note.module || "-",
           note.requesterPic || "-",
           note.note,
+          note.formName ?? "-",
+          note.testing?.kind ?? "-",
+          note.testing?.status ?? "-",
+          note.testing?.repairNote ?? "-",
+          note.testing ? (testingIsDone(note) ? "Sudah beres" : "Perlu ditindaklanjuti") : "-",
           note.projectStatus,
           note.projectPriority,
           note.createdAtText,
@@ -3456,7 +3735,7 @@ export default function Home() {
     setProjectView("detail");
     setSelectedProjectId(project.id);
     setTaskProjectId(project.id);
-    setDetailTab("notes");
+    setDetailTab("savedNotes");
     setDetailNotice("");
     setDetailError("");
   };
@@ -4580,11 +4859,14 @@ export default function Home() {
                       <span className={`mx-2 ${mutedText}`}>/</span>
                       {workKind(selectedProject.caseKind)}
                     </p>
+                    <div className="flex flex-wrap items-center gap-3">
                     <span
                       className={`rounded-full px-3 py-1 text-xs font-semibold ${selectedProject.status === "Selesai" ? "bg-emerald-400/15 text-emerald-500" : `${softCardBg} ${mutedText}`}`}
                     >
                       {selectedProject.status}
                     </span>
+                      <button type="button" className={buttonClass} onClick={() => setNoteModalOpen(true)}>＋ Tambah Catatan</button>
+                    </div>
                   </div>
                   <h2 className="whitespace-pre-wrap break-words text-xl font-semibold leading-relaxed sm:text-2xl">
                     {selectedProject.title}
@@ -4738,6 +5020,9 @@ export default function Home() {
                   </details>
                 </section>
                 <section className={panelClass}>
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <h2 className="text-sm font-semibold">Aktivitas pekerjaan</h2>
+                  </div>
                   <div
                     role="tablist"
                     aria-label="Aktivitas pekerjaan"
@@ -4745,7 +5030,6 @@ export default function Home() {
                   >
                     {(
                       [
-                        ["notes", "Catatan", selectedProjectNotes.length],
                         [
                           "tasks",
                           "Tugas",
@@ -4760,6 +5044,7 @@ export default function Home() {
                             (item) => item.projectId === selectedProject.id,
                           ).length,
                         ],
+                        ["savedNotes", "Catatan Tersimpan", selectedProjectNotes.length],
                       ] as const
                     ).map(([id, label, count]) => (
                       <button
@@ -4777,97 +5062,28 @@ export default function Home() {
                         className={`shrink-0 border-b-2 px-4 py-3 font-medium ${detailTab === id ? `border-emerald-400 ${smallAccent}` : `border-transparent ${mutedText}`}`}
                       >
                         {label}
-                        <span className={`ml-2 text-xs ${mutedText}`}>
+                        {count !== null && <span className={`ml-2 text-xs ${mutedText}`}>
                           {count}
-                        </span>
+                        </span>}
                       </button>
                     ))}
                   </div>
-                  {detailTab === "notes" && (
-                    <div
-                      id="detail-panel-notes"
-                      role="tabpanel"
-                      aria-labelledby="detail-tab-notes"
-                      className="pt-5"
-                    >
-                      <details
-                        key={`note-${selectedProject.id}`}
-                        className={`mb-5 rounded-xl border ${borderColor} p-4`}
-                      >
-                        <summary
-                          className={`cursor-pointer font-medium ${smallAccent}`}
-                        >
-                          ＋ Tambah catatan
-                        </summary>
-                        <form onSubmit={saveNote} className="mt-4 space-y-3">
-                          <label className="block">
-                            <span className={`mb-1 block text-xs ${mutedText}`}>
-                              Tanggal catatan
-                            </span>
-                            <input
-                              required
-                              type="date"
-                              disabled={isSavingNote}
-                              value={noteDate}
-                              onChange={(e) => setNoteDate(e.target.value)}
-                              className={`sm:max-w-52 ${inputClass}`}
-                            />
-                          </label>
-                          <textarea
-                            aria-label="Catatan progress"
-                            required={!noteImageDraft.images.length}
-                            disabled={isSavingNote}
-                            value={noteText}
-                            onChange={(e) => setNoteText(e.target.value)}
-                            className={`${inputClass} min-h-24`}
-                            placeholder="Tulis perkembangan atau hasil pekerjaan..."
-                          />
-                          {noteImageDraft.error && (
-                            <p role="alert" className="text-rose-500">
-                              {noteImageDraft.error}
-                            </p>
-                          )}
-                          <button
-                            disabled={isSavingNote}
-                            className={buttonClass}
-                          >
-                            {isSavingNote ? "Menyimpan..." : "Simpan catatan"}
-                          </button>
-                        </form>
-                      </details>
-                      <div className="space-y-4">
-                        {selectedProjectNotes.map((note) => (
-                          <article
-                            key={note.id}
-                            className={`border-b ${borderColor} pb-4 last:border-0`}
-                          >
-                            <div className="mb-2 flex items-center justify-between gap-3">
-                              <p className={`text-xs ${mutedText}`}>
-                                {formatInputDate(note.noteDate)}
-                              </p>
-                              <button
-                                type="button"
-                                onClick={() => deleteNote(note.id)}
-                                className="text-xs text-rose-500"
-                              >
-                                Hapus
-                              </button>
-                            </div>
-                            <p className="whitespace-pre-wrap break-words leading-relaxed">
-                              {note.note}
-                            </p>
-                            <NoteImageGallery
-                              images={note.attachments}
-                              onOpen={openNoteImages}
-                            />
-                          </article>
-                        ))}
-                      </div>
-                      {!selectedProjectNotes.length && (
-                        <p className={`py-5 text-center ${mutedText}`}>
-                          Belum ada catatan untuk pekerjaan ini.
-                        </p>
-                      )}
+                  {detailTab === "savedNotes" && (
+                    <div id="detail-panel-savedNotes" role="tabpanel" aria-labelledby="detail-tab-savedNotes" className="pt-5">
+                      <CompactNotes
+                        key={selectedProject.id}
+                        notes={selectedProjectNotes}
+                        onEdit={setEditingNote}
+                        onDelete={deleteNote}
+                        onOpenImages={openNoteImages}
+                        inputClass={inputClass}
+                        secondaryButton={secondaryButton}
+                        onResolve={async (note, resolved) => {
+                          if (!currentUser || !note.testing) throw new Error("Login diperlukan");
+                          await updateDoc(doc(db, "workProjectNotes", note.id), { "testing.resolved": resolved, updatedAt: serverTimestamp() });
+                          await fetchProjects();
+                        }}
+                      />
                     </div>
                   )}
                   {detailTab === "tasks" && (
@@ -5394,11 +5610,14 @@ export default function Home() {
                     <p className="mt-3 whitespace-pre-wrap break-words text-[13px] leading-5">
                       {note.note}
                     </p>
+                    {note.formName && <p className="mt-2 text-xs">Form: {note.formName}</p>}
+                    <TestingSummary result={note.testing} />
                     <NoteImageGallery
                       images={note.attachments}
                       onOpen={openNoteImages}
                     />
                     <div className="mt-3 flex flex-wrap gap-2">
+                      <button type="button" className={secondaryButton} onClick={() => setEditingNote(note)}>Edit</button>
                       <button
                         type="button"
                         className={secondaryButton}
@@ -5416,6 +5635,7 @@ export default function Home() {
                         type="button"
                         className="px-3 py-2 text-[12px] font-bold text-red-500"
                         onClick={() => deleteNote(note.id)}
+                        hidden={!!note.testing}
                       >
                         Hapus
                       </button>
@@ -6151,6 +6371,87 @@ export default function Home() {
           </section>
         )}
       </section>
+
+      {noteModalOpen && selectedProject && currentUser && (
+        <CreateNoteModal panelClass={panelClass} saving={isSavingNote} onClose={() => setNoteModalOpen(false)} title={selectedProject.status === "Testing" ? "Catat hasil pengujian" : "Tambah catatan"}>
+          <p className={`mt-1 text-xs ${mutedText}`}>{selectedProject.title}</p>
+                        <form onSubmit={saveNote} className="mt-4 space-y-3">
+                          <label className="block">
+                            <span className={`mb-1 block text-xs ${mutedText}`}>
+                              Tanggal catatan
+                            </span>
+                            <input
+                              autoFocus
+                              required
+                              type="date"
+                              disabled={isSavingNote}
+                              value={noteDate}
+                              onChange={(e) => setNoteDate(e.target.value)}
+                              className={`sm:max-w-52 ${inputClass}`}
+                            />
+                          </label>
+                          <FormCombobox value={noteFormName} onChange={setNoteFormName} options={formOptionsFor(selectedProject.client)} onCreate={name => addMasterForm(selectedProject.client, name)} disabled={isSavingNote} inputClass={inputClass} />
+                          {selectedProject.status === "Testing" && <>
+                            <p className={`text-xs ${mutedText}`}>Pilih jenis pengujian, tulis hasilnya, lalu tentukan status. Catatan perbaikan opsional untuk status Mengalami Kendala dan wajib untuk Perlu Penyempurnaan.</p>
+                            <div className="grid gap-3 sm:grid-cols-2">
+                              <label className="block"><span className={`mb-1 block text-xs ${mutedText}`}>Jenis pengujian</span>
+                                <select className={inputClass} value={testingKind} disabled={isSavingNote} onChange={(e) => setTestingKind(e.target.value as TestingResult["kind"])}>{testingKinds.map(kind => <option key={kind}>{kind}</option>)}</select>
+                              </label>
+                              <label className="block"><span className={`mb-1 block text-xs ${mutedText}`}>Status pengujian</span>
+                                <select className={inputClass} value={testingStatus} disabled={isSavingNote} onChange={(e) => setTestingStatus(e.target.value as TestingResult["status"])}>{testingStatuses.map(status => <option key={status}>{status}</option>)}</select>
+                              </label>
+                            </div>
+                            <label htmlFor="testing-result-note" className="block text-xs">Catatan hasil pengujian</label>
+                          </>}
+                          <textarea
+                            id="testing-result-note"
+                            aria-label={selectedProject.status === "Testing" ? "Catatan hasil pengujian" : "Catatan progress"}
+                            required={selectedProject.status === "Testing" || !noteImageDraft.images.length}
+                            disabled={isSavingNote}
+                            value={noteText}
+                            onChange={(e) => setNoteText(e.target.value)}
+                            className={`${inputClass} min-h-24`}
+                            placeholder="Tulis perkembangan atau hasil pekerjaan..."
+                          />
+                          {selectedProject.status === "Testing" && testingStatus !== "Berhasil" && (
+                            <label className="block"><span className={`mb-1 block text-xs ${mutedText}`}>Catatan perbaikan ({testingStatus === "Perlu Penyempurnaan" ? "wajib" : "opsional"})</span>
+                              <textarea required={testingStatus === "Perlu Penyempurnaan"} disabled={isSavingNote} className={`${inputClass} min-h-24`} value={testingRepairNote} onChange={(e) => setTestingRepairNote(e.target.value)} placeholder="Jelaskan kendala atau kekurangan serta perbaikan yang diperlukan..." />
+                            </label>
+                          )}
+                          {noteImageDraft.error && (
+                            <p role="alert" className="text-rose-500">
+                              {noteImageDraft.error}
+                            </p>
+                          )}
+                          <div className="flex flex-wrap gap-2">
+                          <button
+                            disabled={isSavingNote}
+                            className={buttonClass}
+                          >
+                            {isSavingNote ? "Menyimpan..." : selectedProject.status === "Testing" ? "Simpan hasil pengujian" : "Simpan catatan"}
+                          </button>
+                          <button type="button" disabled={isSavingNote} className={secondaryButton} onClick={() => setNoteModalOpen(false)}>Batal</button>
+                          </div>
+                        </form>
+        </CreateNoteModal>
+      )}
+
+      {editingNote && currentUser && <EditNoteDialog
+        key={editingNote.id}
+        note={editingNote}
+        formOptions={formOptionsFor(projects.find(project => project.id === editingNote.projectId)?.client ?? "")}
+        onCreateForm={name => addMasterForm(projects.find(project => project.id === editingNote.projectId)?.client ?? "", name)}
+        inputClass={inputClass}
+        buttonClass={buttonClass}
+        secondaryButton={secondaryButton}
+        panelClass={panelClass}
+        onClose={() => setEditingNote(null)}
+        onSave={async (changes) => {
+          if (!currentUser) throw new Error("Login diperlukan");
+          await updateDoc(doc(db, "workProjectNotes", editingNote.id), { ...changes, updatedAt: serverTimestamp() });
+          await fetchProjects();
+        }}
+      />}
 
       {imageViewer && (
         <div
