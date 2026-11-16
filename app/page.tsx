@@ -4165,6 +4165,31 @@ export default function Home() {
                 </div>
               ))}
             </div>
+            <section className={panelClass} aria-labelledby="recent-transactions-title">
+              <div className="mb-4">
+                <h2 id="recent-transactions-title" className="text-[16px] font-semibold">Transaksi Terbaru</h2>
+                <p className={`mt-1 text-[13px] ${mutedText}`}>5 pekerjaan yang terakhir diinput. Klik untuk membuka detail.</p>
+              </div>
+              <div className={`divide-y ${isDarkMode ? "divide-[#2B2F34]" : "divide-neutral-200"}`}>
+                {[...projects]
+                  .sort((a, b) => b.createdAtMillis - a.createdAtMillis || b.id.localeCompare(a.id))
+                  .slice(0, 5)
+                  .map(project => (
+                    <button key={project.id} type="button" onClick={() => selectCase(project)} className="flex w-full items-center justify-between gap-3 rounded-lg px-2 py-3 text-left transition-colors hover:bg-emerald-400/10 focus-visible:outline-emerald-400">
+                      <div className="min-w-0">
+                        <p className={`text-[11px] font-medium ${smallAccent}`}>{getCaseContext(project)}</p>
+                        <h3 className="mt-1 break-words text-[14px] font-semibold">{project.title}</h3>
+                        <p className={`mt-1 text-[11px] ${mutedText}`}>Diinput: {project.createdAtMillis ? project.createdAtText : "Waktu belum tercatat"}</p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-3">
+                        <span className={`rounded-full px-2 py-1 text-[11px] ${project.status === "Selesai" ? "bg-emerald-400/15 text-emerald-500" : `${softCardBg} ${mutedText}`}`}>{project.status}</span>
+                        <span aria-hidden="true" className={smallAccent}>↗</span>
+                      </div>
+                    </button>
+                  ))}
+              </div>
+              {!projects.length && <p className={`py-4 text-center text-[13px] ${mutedText}`}>{isLoadingProjects ? "Memuat transaksi terbaru..." : "Belum ada transaksi. Tambahkan pekerjaan untuk mulai mencatat."}</p>}
+            </section>
             <details className={`${panelClass} group`}>
               <summary className="flex cursor-pointer list-none items-center justify-between gap-3 font-medium">
                 <span>
