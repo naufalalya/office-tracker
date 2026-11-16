@@ -1186,6 +1186,10 @@ export default function Home() {
     .filter((item) => item.projectId === selectedProjectId)
     .sort((a, b) => b.createdAtMillis - a.createdAtMillis);
 
+  const printableIssueNotes = selectedProjectNotes.filter(
+    note => note.testing?.status === "Mengalami Kendala" && !testingIsDone(note),
+  );
+
   const pendingTasks = tasks
     .filter((item) => !item.isDone)
     .sort((a, b) => a.taskDate.localeCompare(b.taskDate));
@@ -3332,16 +3336,14 @@ export default function Home() {
   };
 
   const printProjectNotes = () => {
-    if (!selectedProject || !selectedProjectNotes.length) return;
+    if (!selectedProject || !printableIssueNotes.length) return;
     const printWindow = window.open("", "_blank");
     if (!printWindow) {
       alert("Izinkan pop-up pada browser untuk membuka cetakan catatan.");
       return;
     }
     const safe = escapeReportCell;
-    const testing = selectedProjectNotes.filter(note => note.testing);
-    const done = testing.filter(testingIsDone).length;
-    const rows = selectedProjectNotes.map((note, index) => `<article>
+    const rows = printableIssueNotes.map((note, index) => `<article>
       <div class="meta"><b>Catatan ${index + 1}</b><span>${safe(formatInputDate(note.noteDate))}</span></div>
       ${note.formName ? `<p class="meta">Form: ${safe(note.formName)}</p>` : ""}
       ${note.testing ? `<p class="meta">Jenis: ${safe(note.testing.kind)} · Hasil awal: ${safe(note.testing.status)}</p><p class="status">${testingIsDone(note) ? "✓ Sudah beres" : "○ Perlu ditindaklanjuti"}${note.testing.resolved ? " · Sudah diperbaiki" : ""}</p>` : ""}
@@ -3373,8 +3375,8 @@ export default function Home() {
         footer { margin-top: 20px; color: #586472; font-size: 10px; }
         @media print { body { padding: 0; max-width: none; } .toolbar { display: none; } h3, .meta { break-after: avoid; } }
       </style></head><body>
-      <div class="toolbar"><button onclick="window.print()">Cetak / Simpan sebagai PDF</button><p>Pilih tujuan “Simpan sebagai PDF” pada dialog cetak. Semua catatan pekerjaan dicetak, termasuk halaman lainnya.</p></div>
-      <header><h2>Kerja Nowmy · Catatan pekerjaan</h2><h1>${safe(selectedProject.title)}</h1><p>${safe(selectedProject.client)} · ${safe(workKind(selectedProject.caseKind))} · Status pekerjaan: ${safe(selectedProject.status)}</p><p>${selectedProjectNotes.length} catatan · ${testing.length} pengujian · ${done} sudah beres · ${testing.length - done} perlu ditindaklanjuti</p></header>
+      <div class="toolbar"><button onclick="window.print()">Cetak / Simpan sebagai PDF</button><p>Pilih tujuan “Simpan sebagai PDF” pada dialog cetak. Hanya catatan Mengalami Kendala yang belum selesai yang dicetak, termasuk halaman lainnya.</p></div>
+      <header><h2>Kerja Nowmy · Catatan pekerjaan</h2><h1>${safe(selectedProject.title)}</h1><p>${safe(selectedProject.client)} · ${safe(workKind(selectedProject.caseKind))} · Status pekerjaan: ${safe(selectedProject.status)}</p><p>${printableIssueNotes.length} catatan kendala · Perlu ditindaklanjuti</p></header>
       ${rows}<footer>Dicetak oleh ${safe(username)} · ${safe(new Date().toLocaleString("id-ID", { timeZone: "Asia/Jakarta" }))} WIB</footer>
       <script>window.addEventListener('load', function () { window.focus(); window.print(); }, { once: true });</script>
       </body></html>`);
@@ -5146,9 +5148,10 @@ export default function Home() {
                   {detailTab === "savedNotes" && (
                     <div id="detail-panel-savedNotes" role="tabpanel" aria-labelledby="detail-tab-savedNotes" className="pt-5">
                       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                        <p className={`text-xs ${mutedText}`}>Cetak seluruh catatan pekerjaan, termasuk halaman lainnya.</p>
-                        <button type="button" className={secondaryButton} disabled={!selectedProjectNotes.length} onClick={printProjectNotes}>Cetak PDF</button>
+                        <p className={`text-xs ${mutedText}`}>Cetak hanya kendala yang belum selesai. Catatan berhasil atau sudah diceklis tidak dicetak.</p>
+                        <button type="button" className={secondaryButton} disabled={!printableIssueNotes.length} onClick={printProjectNotes}>Cetak PDF Kendala</button>
                       </div>
+                      {!printableIssueNotes.length && <p className={`mb-3 text-xs ${mutedText}`}>Tidak ada kendala yang perlu dicetak.</p>}
                       <CompactNotes
                         key={selectedProject.id}
                         notes={selectedProjectNotes}
