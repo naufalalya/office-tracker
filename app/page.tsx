@@ -3331,6 +3331,56 @@ export default function Home() {
       .replace(/\"/g, "&quot;");
   };
 
+  const printProjectNotes = () => {
+    if (!selectedProject || !selectedProjectNotes.length) return;
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      alert("Izinkan pop-up pada browser untuk membuka cetakan catatan.");
+      return;
+    }
+    const safe = escapeReportCell;
+    const testing = selectedProjectNotes.filter(note => note.testing);
+    const done = testing.filter(testingIsDone).length;
+    const rows = selectedProjectNotes.map((note, index) => `<article>
+      <div class="meta"><b>Catatan ${index + 1}</b><span>${safe(formatInputDate(note.noteDate))}</span></div>
+      ${note.formName ? `<p class="meta">Form: ${safe(note.formName)}</p>` : ""}
+      ${note.testing ? `<p class="meta">Jenis: ${safe(note.testing.kind)} · Hasil awal: ${safe(note.testing.status)}</p><p class="status">${testingIsDone(note) ? "✓ Sudah beres" : "○ Perlu ditindaklanjuti"}${note.testing.resolved ? " · Sudah diperbaiki" : ""}</p>` : ""}
+      <h3>${note.testing ? "Catatan hasil pengujian" : "Catatan"}</h3>
+      <p class="content">${safe(note.note || "—")}</p>
+      ${note.testing?.repairNote ? `<div class="repair"><h3>Catatan perbaikan</h3><p class="content">${safe(note.testing.repairNote)}</p></div>` : ""}
+      ${note.attachments.length ? `<div class="attachments"><h3>Lampiran</h3>${note.attachments.map(image => `<figure><img src="${safe(image.url)}" alt="${safe(image.name)}" /><figcaption>${safe(image.name)}</figcaption></figure>`).join("")}</div>` : ""}
+    </article>`).join("");
+    printWindow.document.open();
+    printWindow.document.write(`<!doctype html><html lang="id"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Catatan - ${safe(selectedProject.title)}</title>
+      <style>
+        @page { size: A4; margin: 16mm; }
+        * { box-sizing: border-box; }
+        body { margin: 0 auto; max-width: 800px; padding: 24px; color: #17212b; background: #fff; font: 12px Arial, sans-serif; line-height: 1.6; }
+        h1 { font-size: 22px; margin: 6px 0 12px; overflow-wrap: anywhere; }
+        h2 { font-size: 14px; margin: 0; }
+        h3 { font-size: 12px; margin: 12px 0 4px; }
+        header { border-bottom: 2px solid #16734b; padding-bottom: 16px; margin-bottom: 20px; }
+        article { border: 1px solid #ccd3d8; border-radius: 8px; padding: 16px; margin-bottom: 14px; }
+        .meta { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; color: #4a5562; margin: 4px 0; overflow-wrap: anywhere; }
+        .status { font-weight: bold; margin: 8px 0; }
+        .content { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+        .repair { border-left: 3px solid #a4adb5; padding-left: 12px; }
+        figure { margin: 12px 0; break-inside: avoid; }
+        img { display: block; max-width: 100%; max-height: 180mm; object-fit: contain; }
+        figcaption { font-size: 10px; overflow-wrap: anywhere; color: #586472; }
+        .toolbar { margin-bottom: 20px; padding: 12px; background: #eef5f1; }
+        button { padding: 10px 16px; cursor: pointer; }
+        footer { margin-top: 20px; color: #586472; font-size: 10px; }
+        @media print { body { padding: 0; max-width: none; } .toolbar { display: none; } h3, .meta { break-after: avoid; } }
+      </style></head><body>
+      <div class="toolbar"><button onclick="window.print()">Cetak / Simpan sebagai PDF</button><p>Pilih tujuan “Simpan sebagai PDF” pada dialog cetak. Semua catatan pekerjaan dicetak, termasuk halaman lainnya.</p></div>
+      <header><h2>Kerja Nowmy · Catatan pekerjaan</h2><h1>${safe(selectedProject.title)}</h1><p>${safe(selectedProject.client)} · ${safe(workKind(selectedProject.caseKind))} · Status pekerjaan: ${safe(selectedProject.status)}</p><p>${selectedProjectNotes.length} catatan · ${testing.length} pengujian · ${done} sudah beres · ${testing.length - done} perlu ditindaklanjuti</p></header>
+      ${rows}<footer>Dicetak oleh ${safe(username)} · ${safe(new Date().toLocaleString("id-ID", { timeZone: "Asia/Jakarta" }))} WIB</footer>
+      <script>window.addEventListener('load', function () { window.focus(); window.print(); }, { once: true });</script>
+      </body></html>`);
+    printWindow.document.close();
+  };
+
   const buildExcelWorksheet = (
     name: string,
     rows: (string | number | boolean | null | undefined)[][],
@@ -5070,6 +5120,10 @@ export default function Home() {
                   </div>
                   {detailTab === "savedNotes" && (
                     <div id="detail-panel-savedNotes" role="tabpanel" aria-labelledby="detail-tab-savedNotes" className="pt-5">
+                      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                        <p className={`text-xs ${mutedText}`}>Cetak seluruh catatan pekerjaan, termasuk halaman lainnya.</p>
+                        <button type="button" className={secondaryButton} disabled={!selectedProjectNotes.length} onClick={printProjectNotes}>Cetak PDF</button>
+                      </div>
                       <CompactNotes
                         key={selectedProject.id}
                         notes={selectedProjectNotes}
